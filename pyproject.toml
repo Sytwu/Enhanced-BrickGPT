@@ -6,12 +6,14 @@ readme = "README.md"
 authors = [
     { name = "Ava Pun", email = "apun@andrew.cmu.edu" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "bpy",
     "gurobipy",
     "numpy<2", # lower version of numpy needed for bpy
+    "open_clip_torch",
     "peft",
+    "pillow",
     "torch",
     "transformers",
 ]

@@ -13,3 +13,14 @@ wheels/
 wandb
 *.un~
 .DS_Store
+
+# LDraw parts library (can be ~5GB)
+ldraw
+
+# Gurobi license
+gurobi.lic
+
+# Output Files
+output.png
+output.txt
+output.ldr
