@@ -1,5 +1,4 @@
-import random
-
+import numpy as np
 import torch
 
 from brickgpt.masking import MaskConditioningConfig, MaskBrickDataset, MaskDataCollator
@@ -31,6 +30,8 @@ DATA = [
     {'captions': ['a chair'], 'bricks': '2x6 (0,0,0)\n'},
 ]
 
+V = MaskConditioningConfig().num_views  # 3
+
 
 def test_dataset_flattening_and_item_shapes():
     ds = MaskBrickDataset(DATA, FakeTokenizer(), MaskConditioningConfig(), train=False)
@@ -43,7 +44,18 @@ def test_dataset_flattening_and_item_shapes():
     assert item['labels'].shape == item['input_ids'].shape
     assert item['attention_mask'].shape == item['input_ids'].shape
     assert torch.all(item['attention_mask'] == 1)
-    assert item['mask'].shape == (1, 20, 20)
+    assert item['mask'].shape == (V, 20, 20)
+    assert item['has_mask'].shape == (V,)
+    assert item['has_mask'].dtype == torch.bool
+
+
+def test_three_views_differ():
+    # A single flat 2x6 brick (ds[2]) projects differently along each axis:
+    #   top=(x,y) 2x6,  front=(x,z) 2x1,  side=(y,z) 6x1.  (A symmetric cube would NOT differ.)
+    ds = MaskBrickDataset(DATA, FakeTokenizer(), MaskConditioningConfig(), train=False)
+    mask = ds[2]['mask']
+    assert not torch.equal(mask[0], mask[1])
+    assert not torch.equal(mask[0], mask[2])
 
 
 def test_labels_are_assistant_only():
@@ -56,30 +68,43 @@ def test_labels_are_assistant_only():
     assert torch.all(labels[:first_supervised] == -100)
 
 
-def test_condition_dropout_always_and_never():
-    cfg_always = MaskConditioningConfig(condition_dropout_p=1.0)
-    ds = MaskBrickDataset(DATA, FakeTokenizer(), cfg_always, train=True)
-    item = ds[0]
-    assert item['has_mask'] is False
-    assert not item['mask'].any()              # null mask is all zeros
+def test_per_view_dropout_keep_all_and_none():
+    # view_keep_probs over the number of kept views {0,1,2,3}.
+    keep_all = MaskConditioningConfig(view_keep_probs=(0.0, 0.0, 0.0, 1.0))
+    item = MaskBrickDataset(DATA, FakeTokenizer(), keep_all, train=True)[0]
+    assert bool(item['has_mask'].all())
+    assert item['mask'].any()                  # at least one provided view is non-empty
 
-    cfg_never = MaskConditioningConfig(condition_dropout_p=0.0)
-    ds2 = MaskBrickDataset(DATA, FakeTokenizer(), cfg_never, train=True)
-    item2 = ds2[0]
-    assert item2['has_mask'] is True
-    assert item2['mask'].any()
+    keep_none = MaskConditioningConfig(view_keep_probs=(1.0, 0.0, 0.0, 0.0))
+    item = MaskBrickDataset(DATA, FakeTokenizer(), keep_none, train=True)[0]
+    assert not item['has_mask'].any()
+    assert not item['mask'].any()              # all views dropped -> all-zeros
 
-    # Dropout is disabled outside training even with p=1.0.
-    ds3 = MaskBrickDataset(DATA, FakeTokenizer(), cfg_always, train=False)
-    assert ds3[0]['has_mask'] is True
+    # Dropout is disabled outside training: all views provided regardless of probs.
+    item = MaskBrickDataset(DATA, FakeTokenizer(), keep_none, train=False)[0]
+    assert bool(item['has_mask'].all())
 
 
-def test_condition_dropout_rate_is_about_30_percent():
-    random.seed(0)
-    ds = MaskBrickDataset(DATA, FakeTokenizer(), MaskConditioningConfig(condition_dropout_p=0.3), train=True)
-    n = 3000
-    dropped = sum(0 if ds[0]['has_mask'] else 1 for _ in range(n))
-    assert 0.26 < dropped / n < 0.34
+def test_per_view_dropout_keeps_exactly_one():
+    cfg = MaskConditioningConfig(view_keep_probs=(0.0, 1.0, 0.0, 0.0))
+    ds = MaskBrickDataset(DATA, FakeTokenizer(), cfg, train=True)
+    for _ in range(20):
+        item = ds[0]
+        assert int(item['has_mask'].sum()) == 1
+        # Dropped views are zeroed; the kept (top, non-empty) view is not.
+        assert item['mask'][~item['has_mask']].sum() == 0
+
+
+def test_per_view_dropout_distribution():
+    np.random.seed(0)
+    cfg = MaskConditioningConfig(view_keep_probs=(0.10, 0.60, 0.15, 0.15))
+    ds = MaskBrickDataset(DATA, FakeTokenizer(), cfg, train=True)
+    n = 4000
+    counts = np.zeros(V + 1)
+    for _ in range(n):
+        counts[int(ds[0]['has_mask'].sum())] += 1
+    freq = counts / n
+    assert np.allclose(freq, cfg.view_keep_probs, atol=0.03)
 
 
 def test_collator_pads_and_stacks():
@@ -91,8 +116,8 @@ def test_collator_pads_and_stacks():
     assert batch['input_ids'].shape == (b, max_len)
     assert batch['attention_mask'].shape == (b, max_len)
     assert batch['labels'].shape == (b, max_len)
-    assert batch['mask'].shape == (b, 1, 20, 20)
-    assert batch['has_mask'].shape == (b,)
+    assert batch['mask'].shape == (b, V, 20, 20)
+    assert batch['has_mask'].shape == (b, V)
     assert batch['has_mask'].dtype == torch.bool
     # Padding positions: pad_token_id in input_ids, -100 in labels, 0 in attention_mask.
     shortest = min(range(3), key=lambda i: ds[i]['input_ids'].size(0))

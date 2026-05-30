@@ -1,7 +1,10 @@
 from .rewards import (
+    RewardConfig,
+    RewardBreakdown,
     syntax_reward,
-    silhouette_iou_reward,
-    stability_reward,
-    total_reward,
-    bricks_to_occupancy_tensor,
+    overlap_penalty,
+    stability_reward_from_structure,
+    silhouette_iou_from_structure,
+    normalize_clip_score,
+    compute_reward,
 )

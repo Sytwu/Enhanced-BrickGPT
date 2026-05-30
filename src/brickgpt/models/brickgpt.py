@@ -110,7 +110,14 @@ def get_device() -> str:
 
 
 class BrickGPT:
-    def __init__(self, cfg: BrickGPTConfig):
+    def __init__(self, cfg: BrickGPTConfig, llm: LLM | None = None):
+        """
+        :param cfg: Generation configuration.
+        :param llm: Optional pre-built :class:`LLM` to drive generation. If given, it is used as-is
+                    (no disk load) and its device wins -- e.g. to generate from an in-memory training
+                    model via :meth:`LLM.from_model`. If ``None``, an ``LLM`` is loaded from
+                    ``cfg.model_name_or_path``.
+        """
         self.world_dim = cfg.world_dim
         self.max_bricks = cfg.max_bricks
         self.max_brick_rejections = cfg.max_brick_rejections
@@ -122,7 +129,7 @@ class BrickGPT:
         self.max_temperature = cfg.max_temperature
         self.top_k = cfg.top_k
         self.top_p = cfg.top_p
-        self.device = get_device() if cfg.device == 'auto' else cfg.device
+        self.device = llm.device if llm is not None else (get_device() if cfg.device == 'auto' else cfg.device)
 
         instruction_fns = {
             'brickgpt': create_instruction,
@@ -131,9 +138,29 @@ class BrickGPT:
         }
         self.instruction_fn = instruction_fns[cfg.instruction_format]
 
-        self.llm = LLM(cfg.model_name_or_path, self.device)
+        self.llm = llm if llm is not None else LLM(cfg.model_name_or_path, self.device)
 
-    def __call__(self, caption: str) -> dict:
+        # Optional mask-prefix encoder for mask-conditioned generation. Left None for the text-only
+        # model; set externally (e.g. from a trained BrickGPTWithMask) to condition on silhouettes.
+        self.mask_prefix_encoder = None
+
+    def __call__(
+            self,
+            caption: str,
+            mask: torch.Tensor | None = None,
+            has_mask: torch.Tensor | None = None,
+            prefix_embeds: torch.Tensor | None = None,
+    ) -> dict:
+        """
+        Generates a brick structure for ``caption``, optionally conditioned on a 2D silhouette.
+
+        Mask conditioning (Step B) can be supplied two ways: pass ``prefix_embeds`` directly
+        ``(1, T, hidden)``, or pass ``mask`` ``(1, V, H, W)`` (+ optional ``has_mask`` ``(1, V)``)
+        to have :attr:`mask_prefix_encoder` encode it. The prefix is computed once and pre-filled
+        into the KV-cache for every (re)generation attempt.
+        """
+        prefix_embeds = self._resolve_prefix_embeds(mask, has_mask, prefix_embeds)
+
         bricks = None
         starting_bricks = BrickStructure([])
         rejection_reasons = Counter()
@@ -141,7 +168,8 @@ class BrickGPT:
 
         # Generate brick structure. If it is unstable, remove all bricks after the first unstable brick and regenerate.
         for regeneration_num in range(self.max_regenerations + 1):
-            bricks, this_rejection_reasons = self._generate_structure(caption, starting_bricks=starting_bricks)
+            bricks, this_rejection_reasons = self._generate_structure(
+                caption, starting_bricks=starting_bricks, prefix_embeds=prefix_embeds)
             rejection_reasons.update(this_rejection_reasons)
             if self.max_regenerations == 0 or self._is_stable(bricks):
                 break
@@ -156,15 +184,37 @@ class BrickGPT:
             'n_regenerations': regeneration_num,
         }
 
+    def _resolve_prefix_embeds(
+            self,
+            mask: torch.Tensor | None,
+            has_mask: torch.Tensor | None,
+            prefix_embeds: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Returns mask prefix embeddings, encoding ``mask`` via :attr:`mask_prefix_encoder` if needed."""
+        if prefix_embeds is not None:
+            return prefix_embeds.to(self.device)
+        if mask is None:
+            return None
+        if self.mask_prefix_encoder is None:
+            raise ValueError('A `mask` was given but no `mask_prefix_encoder` is set on this BrickGPT. '
+                             'Set it from a trained BrickGPTWithMask, or pass `prefix_embeds` directly.')
+        mask = mask.to(self.device)
+        has_mask = has_mask.to(self.device) if has_mask is not None else None
+        with torch.no_grad():
+            return self.mask_prefix_encoder(mask, has_mask)
+
     def _generate_structure(
             self,
             caption: str,
             starting_bricks: BrickStructure = BrickStructure([]),
+            prefix_embeds: torch.Tensor | None = None,
     ) -> (BrickStructure, Counter):
         """
         Generates a brick structure based on the given caption, starting with a partial brick structure.
         :param caption: A caption for the brick structure to be generated.
         :param starting_bricks: A partial brick structure to which the generated bricks will be added.
+        :param prefix_embeds: Optional mask prefix embeddings ``(1, T, hidden)`` to prefill the
+                              KV-cache, conditioning generation on a silhouette (Step B).
         :return: A tuple containing the generated brick structure and a brick rejection reasons.
         """
         starting_bricks = copy.deepcopy(starting_bricks)
@@ -181,11 +231,18 @@ class BrickGPT:
         else:
             prompt = self.llm.tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors='pt')
 
+        # With mask conditioning, prefill the cache with the mask prefix + prompt, then generate by
+        # continuation (prompt=None). Without it, the first brick uses the prompt directly as before.
+        first_prompt = prompt
+        if prefix_embeds is not None:
+            self.llm.prefill_with_embeds(prefix_embeds, prompt)
+            first_prompt = None
+
         # Generate bricks with rejection sampling
         rejection_reasons = Counter()
         for brick_num in range(self.max_bricks):
             brick, rejection_reasons_brick = self.generate_brick_with_rejection_sampling(
-                prompt if brick_num == 0 else None, bricks=starting_bricks
+                first_prompt if brick_num == 0 else None, bricks=starting_bricks
             )
             if not brick:  # EOS token was generated
                 break

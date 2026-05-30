@@ -1,128 +1,204 @@
 """
-Reward functions for the GRPO RL phase (Phase 4).
+Reward functions for the GRPO RL phase (Step C / D3-D4).
 
-These are fast, Tensor-friendly baselines. **Never call the Gurobi solver inside the RL loop** — use
-the connectivity check (or the TODO Union-Find rewrite) for stability.
+Design (D3): a **syntax gate** short-circuits to ``-1`` for any ill-formatted / out-of-library
+output (skipping structure building, IoU, and rendering). Otherwise the total reward sums a graded
+**overlap** penalty, a connectivity-based **stability** term, a 3-view silhouette **IoU** averaged
+over the *provided* views, and an optional CLIP **semantic** term.
 
-TODO(handoff): tune the reward shaping/weights, and vectorize ``silhouette_iou_reward`` and
-``stability_reward`` to operate on a whole group of samples at once on the GPU.
+These are fast and Tensor-friendly. **Never call the Gurobi solver inside the RL loop** -- stability
+uses the connectivity graph. Rendering/CLIP (semantic) is seconds-per-sample like Gurobi: it is
+*off by default* and the score must be passed in precomputed, so this module pulls in no Blender/CLIP
+dependency.
+
+Overlap vs stability double-count (D3.3): resolved by penalizing overlap **once**. The overlap term
+is the only place collisions are penalized; stability is computed in an overlap-independent way
+(:func:`~brickgpt.stability_analysis.connectivity_score` builds its graph from the brick list and is
+robust to overlapping bricks), so a collision does not also force stability to ``-1``.
 """
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
 from brickgpt.data import Brick, BrickStructure
-
-from brickgpt.masking import MaskConditioningConfig
+from brickgpt.masking import MaskConditioningConfig, VIEW_AXES
+from brickgpt.stability_analysis import connectivity_score
 
 logger = logging.getLogger(__name__)
 
 
-def syntax_reward(bricks_txt: str) -> float:
-    """
-    +1 if every non-empty line is a syntactically valid, in-library brick; -1 otherwise.
+@dataclass
+class RewardConfig:
+    """Ablation knobs for the GRPO reward (D4). Syntax is a hard gate, not a weighted term."""
+    use_syntax_gate: bool = True
+    use_overlap: bool = True
+    use_stability: bool = True
+    use_iou: bool = True
+    use_semantic: bool = False   # off by default: needs rendering (seconds/sample)
+    w_overlap: float = 1.0
+    w_stability: float = 1.0
+    w_iou: float = 1.0
+    w_semantic: float = 1.0
+    clip_lo: float = 0.15
+    clip_hi: float = 0.35
+    use_multi_turn: bool = False
 
-    Reuses :meth:`brickgpt.data.Brick.from_txt` (the same regex used during inference) and the
-    brick-library lookup behind :attr:`Brick.brick_id`.
-    """
-    lines = [line.strip() for line in bricks_txt.splitlines() if line.strip()]
-    if not lines:
-        return -1.0
-    for line in lines:
-        try:
-            brick = Brick.from_txt(line)
-            _ = brick.brick_id  # Raises ValueError if dimensions are not in the library.
-        except ValueError:
-            return -1.0
-    return 1.0
+    def __post_init__(self):
+        if self.use_multi_turn and (self.use_iou or self.use_semantic):
+            raise ValueError('multi-turn (step-level) rewards are incompatible with use_iou / '
+                             'use_semantic, which need a complete trajectory.')
 
 
-def bricks_to_occupancy_tensor(
-        bricks_txt: str,
-        cfg: MaskConditioningConfig = MaskConditioningConfig(),
-        device: str | torch.device = 'cpu',
-) -> torch.Tensor:
-    """
-    "Paints" the generated bricks into a 2D top-down occupancy tensor by splatting each brick's
-    footprint slice. Stays on ``device`` so the IoU can be computed without a CPU round-trip.
+@dataclass
+class RewardBreakdown:
+    """Per-component reward, for logging (D6). ``None`` means a term was gated/disabled/not applicable."""
+    total: float
+    syntax_ok: bool
+    overlap: float | None = None
+    stability: float | None = None
+    iou: float | None = None
+    semantic: float | None = None
 
-    :return: A boolean tensor of shape ``(world_dim, world_dim)``.
-    """
-    occ = torch.zeros((cfg.world_dim, cfg.world_dim), dtype=torch.bool, device=device)
+    def components(self) -> dict[str, float]:
+        """The non-None components (for averaging into wandb), excluding ``total``/``syntax_ok``."""
+        return {k: v for k, v in (('overlap', self.overlap), ('stability', self.stability),
+                                  ('iou', self.iou), ('semantic', self.semantic)) if v is not None}
+
+
+# --- primitives ----------------------------------------------------------------------------------
+
+def _valid_bricks(bricks_txt: str) -> list[Brick] | None:
+    """Parses every non-empty line; returns the brick list, or ``None`` if any line is invalid."""
+    bricks = []
     for line in bricks_txt.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             brick = Brick.from_txt(line)
+            _ = brick.brick_id  # raises ValueError if dimensions are not in the library
         except ValueError:
+            return None
+        bricks.append(brick)
+    return bricks if bricks else None
+
+
+def syntax_reward(bricks_txt: str) -> float:
+    """+1 if every non-empty line is a syntactically valid, in-library brick; -1 otherwise."""
+    return 1.0 if _valid_bricks(bricks_txt) is not None else -1.0
+
+
+def _safe_structure(bricks: list[Brick], cfg: MaskConditioningConfig) -> BrickStructure | None:
+    """Builds a BrickStructure, returning ``None`` if a brick lands outside the voxel grid (bad z)."""
+    try:
+        return BrickStructure(bricks, world_dim=cfg.world_dim)
+    except (IndexError, ValueError):
+        return None
+
+
+def overlap_penalty(structure: BrickStructure) -> float:
+    """
+    Graded overlap penalty (D3.2): ``-Σ_v max(0, occupancy_v - 1)`` over voxels. 0 when collision-free
+    (the usual case for rejection-sampled outputs); increasingly negative as bricks overlap.
+    """
+    occ = structure.voxel_occupancy
+    return -float(np.clip(occ - 1, 0, None).sum())
+
+
+def stability_reward_from_structure(structure: BrickStructure) -> float:
+    """
+    +1 if the structure is fully connected to the ground with no floating / out-of-bounds bricks;
+    -1 otherwise. Overlap-independent: uses :func:`connectivity_score` on the brick list directly so
+    a collision is *not* double-penalized here (it is handled by :func:`overlap_penalty`).
+    """
+    if structure.has_out_of_bounds_bricks() or structure.has_floating_bricks():
+        return -1.0
+    return 1.0 if connectivity_score(structure).max() < 1 else -1.0
+
+
+def silhouette_iou_from_structure(
+        structure: BrickStructure,
+        target_views: np.ndarray | torch.Tensor,
+        has_mask,
+        cfg: MaskConditioningConfig,
+) -> float | None:
+    """
+    Mean pixel-wise IoU between the generated structure's silhouettes and ``target_views``, averaged
+    over the **provided** views only (D3.4 per-view routing).
+
+    :param target_views: Target silhouettes of shape ``(V, H, W)`` in ``cfg.views`` order.
+    :param has_mask: Per-view presence, shape ``(V,)`` (bool/0-1).
+    :return: Mean IoU in ``[0, 1]``, or ``None`` if no view is provided (routed out).
+    """
+    target_views = np.asarray(target_views, dtype=np.float32) > 0.5
+    presence = np.asarray(has_mask).astype(bool).reshape(-1)
+    ious = []
+    for vi, name in enumerate(cfg.views):
+        if not presence[vi]:
             continue
-        x0, x1 = max(brick.x, 0), min(brick.x + brick.h, cfg.world_dim)
-        y0, y1 = max(brick.y, 0), min(brick.y + brick.w, cfg.world_dim)
-        if x0 < x1 and y0 < y1:
-            occ[x0:x1, y0:y1] = True
-    return occ
+        pred = structure.top_down_mask(VIEW_AXES[name]) > 0.5
+        tgt = target_views[vi]
+        inter = np.logical_and(pred, tgt).sum()
+        union = np.logical_or(pred, tgt).sum()
+        ious.append(1.0 if union == 0 else inter / union)
+    return float(np.mean(ious)) if ious else None
 
 
-def silhouette_iou_reward(
+def normalize_clip_score(score: float, cfg: RewardConfig) -> float:
+    """Maps a raw CLIP cosine to [0,1] via ``clip((s - clip_lo) / (clip_hi - clip_lo), 0, 1)`` (D3.5)."""
+    return float(np.clip((score - cfg.clip_lo) / (cfg.clip_hi - cfg.clip_lo), 0.0, 1.0))
+
+
+# --- total ---------------------------------------------------------------------------------------
+
+def compute_reward(
         bricks_txt: str,
-        target_mask: np.ndarray | torch.Tensor,
-        cfg: MaskConditioningConfig = MaskConditioningConfig(),
-        device: str | torch.device = 'cpu',
-) -> float:
+        target_views: np.ndarray | torch.Tensor | None = None,
+        has_mask=None,
+        cfg: RewardConfig = RewardConfig(),
+        mask_cfg: MaskConditioningConfig = MaskConditioningConfig(),
+        clip_score: float | None = None,
+) -> RewardBreakdown:
     """
-    Pixel-wise IoU between the generated structure's top-down silhouette and the target mask.
+    Computes the GRPO reward for a single completion, returning a :class:`RewardBreakdown` (D6).
 
-    :return: IoU in ``[0, 1]`` (1.0 if both silhouettes are empty).
+    :param bricks_txt: The generated brick list.
+    :param target_views: ``(V, H, W)`` target silhouettes (``cfg.views`` order); needed for IoU.
+    :param has_mask: ``(V,)`` per-view presence; IoU is averaged over provided views only.
+    :param cfg: Reward ablation config.
+    :param mask_cfg: Mask/geometry config (``world_dim``, view order).
+    :param clip_score: Precomputed raw CLIP cosine for the semantic term (rendering is the caller's
+                       job; pass ``None`` to skip even when ``use_semantic`` is set).
     """
-    pred = bricks_to_occupancy_tensor(bricks_txt, cfg, device)
-    target = torch.as_tensor(target_mask, device=device) > 0.5
-    intersection = (pred & target).sum()
-    union = (pred | target).sum()
-    if union == 0:
-        return 1.0
-    return (intersection.float() / union.float()).item()
+    # 1. Syntax gate -- short-circuit, skip everything else.
+    bricks = _valid_bricks(bricks_txt)
+    if cfg.use_syntax_gate and bricks is None:
+        return RewardBreakdown(total=-1.0, syntax_ok=False)
+    if bricks is None:  # gate disabled but still unparseable: nothing to score on.
+        return RewardBreakdown(total=0.0, syntax_ok=False)
 
-
-def stability_reward(
-        bricks_txt: str,
-        cfg: MaskConditioningConfig = MaskConditioningConfig(),
-) -> float:
-    """
-    +1 if the structure is collision-free, in-bounds, has no floating bricks, and is fully connected
-    to the ground; -1 otherwise. Uses the graph-based connectivity check (not Gurobi).
-
-    TODO(handoff): return a graded reward (e.g. fraction of connected bricks) and replace the
-    networkx connectivity check with a vectorized Union-Find / adjacency-matrix pass.
-    """
-    structure = BrickStructure(
-        [Brick.from_txt(line) for line in bricks_txt.splitlines() if line.strip()],
-        world_dim=cfg.world_dim,
-    ) if syntax_reward(bricks_txt) > 0 else None
-
+    structure = _safe_structure(bricks, mask_cfg)
     if structure is None:
-        return -1.0
-    if structure.has_collisions() or structure.has_out_of_bounds_bricks():
-        return -1.0
-    return 1.0 if structure.is_connected() else -1.0
+        return RewardBreakdown(total=-1.0, syntax_ok=False)
 
+    total = 0.0
+    overlap = stability = iou = semantic = None
 
-def total_reward(
-        bricks_txt: str,
-        target_mask: np.ndarray | torch.Tensor,
-        has_mask: bool,
-        weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
-        cfg: MaskConditioningConfig = MaskConditioningConfig(),
-        device: str | torch.device = 'cpu',
-) -> float:
-    """
-    Dynamic reward routing (Phase 5): drop the IoU term for ``[NULL_MASK]`` batches.
+    if cfg.use_overlap:
+        overlap = overlap_penalty(structure)
+        total += cfg.w_overlap * overlap
+    if cfg.use_stability:
+        stability = stability_reward_from_structure(structure)
+        total += cfg.w_stability * stability
+    if cfg.use_iou and target_views is not None and has_mask is not None:
+        iou = silhouette_iou_from_structure(structure, target_views, has_mask, mask_cfg)
+        if iou is not None:  # None == no provided views (routed out)
+            total += cfg.w_iou * iou
+    if cfg.use_semantic and clip_score is not None:
+        semantic = normalize_clip_score(clip_score, cfg)
+        total += cfg.w_semantic * semantic
 
-        total = (w1 if has_mask else 0) * IoU + w2 * Stability + w3 * Syntax
-    """
-    w1, w2, w3 = weights
-    iou = silhouette_iou_reward(bricks_txt, target_mask, cfg, device) if has_mask else 0.0
-    return (w1 if has_mask else 0.0) * iou \
-        + w2 * stability_reward(bricks_txt, cfg) \
-        + w3 * syntax_reward(bricks_txt)
+    return RewardBreakdown(total=total, syntax_ok=True,
+                           overlap=overlap, stability=stability, iou=iou, semantic=semantic)

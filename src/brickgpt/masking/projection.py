@@ -1,12 +1,19 @@
 import logging
 
 import numpy as np
+import torch
 
 from brickgpt.data import Brick, BrickStructure
 
-from .config import MaskConditioningConfig
+from .config import MaskConditioningConfig, VIEW_ORDER
 
 logger = logging.getLogger(__name__)
+
+# Which occupancy-grid axis each view is projected along. The grid is indexed [x, y, z]:
+#   top   -> project along Z (axis 2) -> (x, y)
+#   front -> project along Y (axis 1) -> (x, z)
+#   side  -> project along X (axis 0) -> (y, z)
+VIEW_AXES: dict[str, int] = {'top': 2, 'front': 1, 'side': 0}
 
 
 def _parse_structure(bricks_txt: str, cfg: MaskConditioningConfig) -> BrickStructure:
@@ -59,11 +66,7 @@ def three_view_masks(
     :return: A dict ``{'top': ndarray, 'front': ndarray, 'side': ndarray}`` of binary float32 arrays.
     """
     structure = _parse_structure(bricks_txt, cfg)
-    return {
-        'top': structure.top_down_mask(2),
-        'front': structure.top_down_mask(1),
-        'side': structure.top_down_mask(0),
-    }
+    return {name: structure.top_down_mask(axis) for name, axis in VIEW_AXES.items()}
 
 
 def null_mask(cfg: MaskConditioningConfig = MaskConditioningConfig()) -> np.ndarray:
@@ -75,3 +78,44 @@ def null_mask(cfg: MaskConditioningConfig = MaskConditioningConfig()) -> np.ndar
     :return: A zeros float32 array of shape ``(world_dim, world_dim)``.
     """
     return np.zeros((cfg.world_dim, cfg.world_dim), dtype=np.float32)
+
+
+def stack_views(bricks_txt: str, cfg: MaskConditioningConfig = MaskConditioningConfig()) -> np.ndarray:
+    """
+    Like :func:`three_view_masks`, but returns the views stacked into one array ordered by
+    ``cfg.views`` (canonical :data:`~brickgpt.masking.config.VIEW_ORDER`), ready for the dataset /
+    encoder.
+
+    :return: A float32 array of shape ``(len(cfg.views), world_dim, world_dim)``.
+    """
+    views = three_view_masks(bricks_txt, cfg)
+    return np.stack([views[name] for name in cfg.views], axis=0)
+
+
+def views_to_tensors(
+        views: dict[str, np.ndarray | None],
+        cfg: MaskConditioningConfig = MaskConditioningConfig(),
+) -> tuple['torch.Tensor', 'torch.Tensor']:
+    """
+    Builds the ``(mask, has_mask)`` inference inputs from a partial dict of user-supplied views.
+
+    This is the single-view (or subset) convenience path: the user passes only the views they have
+    (e.g. ``{'top': arr}``); the rest are filled with the null mask and flagged absent. Always
+    returns the full fixed-slot stack in ``cfg.views`` order with a leading batch dim of 1.
+
+    :param views: Maps a subset of ``cfg.views`` to a ``(world_dim, world_dim)`` array. Missing keys
+                  (or ``None`` values) are treated as absent views.
+    :return: ``(mask, has_mask)`` of shapes ``(1, V, world_dim, world_dim)`` float and ``(1, V)`` bool.
+    """
+    masks, presence = [], []
+    for name in cfg.views:
+        arr = views.get(name)
+        if arr is None:
+            masks.append(null_mask(cfg))
+            presence.append(False)
+        else:
+            masks.append(np.asarray(arr, dtype=np.float32))
+            presence.append(True)
+    mask = torch.from_numpy(np.stack(masks, axis=0)).float().unsqueeze(0)   # [1, V, H, W]
+    has_mask = torch.tensor(presence, dtype=torch.bool).unsqueeze(0)        # [1, V]
+    return mask, has_mask

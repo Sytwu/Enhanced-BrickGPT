@@ -31,24 +31,28 @@ class TinyCausalLM(nn.Module):
         return SimpleNamespace(loss=loss, logits=logits)
 
 
-def _batch(bsz=2, seq=5, vocab=64):
+_CFG = MaskConditioningConfig(pretrained_backbone=False)
+
+
+def _batch(bsz=2, seq=5, vocab=64, cfg=_CFG):
     return {
         'input_ids': torch.randint(0, vocab, (bsz, seq)),
         'attention_mask': torch.ones(bsz, seq, dtype=torch.long),
         'labels': torch.randint(0, vocab, (bsz, seq)),
-        'mask': torch.rand(bsz, 1, 20, 20),
+        'mask': torch.rand(bsz, cfg.num_views, 20, 20),
+        'has_mask': torch.ones(bsz, cfg.num_views, dtype=torch.bool),
     }
 
 
 def test_forward_prepends_prefix_and_returns_loss():
     cfg = MaskConditioningConfig(pretrained_backbone=False)
     model = BrickGPTWithMask(TinyCausalLM(hidden=cfg.llm_hidden_size), cfg)
-    batch = _batch(bsz=2, seq=5)
+    batch = _batch(bsz=2, seq=5, cfg=cfg)
     out = model(**batch)
 
     assert out.loss is not None and out.loss.dim() == 0
-    # Sequence is extended by num_prefix_tokens mask tokens.
-    assert out.logits.shape[1] == 5 + cfg.num_prefix_tokens
+    # Sequence is extended by len(views) * num_prefix_tokens mask tokens.
+    assert out.logits.shape[1] == 5 + cfg.total_prefix_tokens
 
 
 def test_freeze_llm_trains_only_mask_encoder():

@@ -88,8 +88,11 @@ class MaskProjection(nn.Module):
 
 class MaskPrefixEncoder(nn.Module):
     """
-    End-to-end module turning a 2D mask into prefix-token embeddings for the LLM:
+    End-to-end module turning a *single* 2D mask into prefix-token embeddings for the LLM:
     ``mask -> MaskEncoder -> MaskProjection -> prefix embeddings``.
+
+    Kept for the single-view path / tests. The 3-view model uses
+    :class:`MultiViewMaskPrefixEncoder`.
     """
 
     def __init__(self, cfg: MaskConditioningConfig = MaskConditioningConfig()):
@@ -104,3 +107,65 @@ class MaskPrefixEncoder(nn.Module):
         :return: Prefix-token embeddings of shape ``(B, num_prefix_tokens, llm_hidden_size)``.
         """
         return self.projection(self.encoder(mask))
+
+
+class MultiViewMaskPrefixEncoder(nn.Module):
+    """
+    Turns the three orthographic silhouettes (top / front / side) into a single block of prefix-token
+    embeddings for the LLM.
+
+    A **shared** :class:`MaskEncoder` + :class:`MaskProjection` encode every view (fewer params, and
+    the pretrained init is reused for all three). Two learned embeddings, added to each view's prefix
+    tokens, let the frozen-init shared encoder be disambiguated downstream:
+
+    - **view-type embedding** (``top`` / ``front`` / ``side``): "which silhouette is this".
+    - **presence embedding** (``provided`` / ``absent``): distinguishes a *dropped* view (null mask,
+      D2 condition dropout) from a *provided* view whose silhouette merely happens to be empty.
+
+    The output always has ``len(views) * num_prefix_tokens`` tokens (fixed slots), so batching is
+    trivial; absent views still occupy their slots (null mask + *absent* presence embedding).
+    """
+
+    def __init__(self, cfg: MaskConditioningConfig = MaskConditioningConfig()):
+        super().__init__()
+        self.cfg = cfg
+        self.num_views = cfg.num_views
+        self.num_prefix_tokens = cfg.num_prefix_tokens
+        self.llm_hidden_size = cfg.llm_hidden_size
+
+        self.encoder = MaskEncoder(cfg)
+        self.projection = MaskProjection(self.encoder.feature_dim, cfg)
+
+        # One vector per view-type / presence-state, broadcast across that view's prefix tokens.
+        self.view_embedding = (
+            nn.Embedding(self.num_views, cfg.llm_hidden_size) if cfg.use_view_embedding else None
+        )
+        self.presence_embedding = (
+            nn.Embedding(2, cfg.llm_hidden_size) if cfg.use_presence_embedding else None
+        )
+
+    def forward(self, mask: torch.Tensor, has_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        :param mask: Mask stack of shape ``(B, V, H, W)`` (``V == len(cfg.views)``).
+        :param has_mask: Optional bool/0-1 tensor of shape ``(B, V)`` marking provided views. If
+                         ``None``, every view is treated as provided.
+        :return: Prefix-token embeddings of shape ``(B, V * num_prefix_tokens, llm_hidden_size)``.
+        """
+        if mask.dim() != 4 or mask.size(1) != self.num_views:
+            raise ValueError(f'Expected mask of shape (B, {self.num_views}, H, W), got {tuple(mask.shape)}')
+        b, v, h, w = mask.shape
+
+        # Encode every view with the shared backbone in one batched pass.
+        feat = self.encoder(mask.reshape(b * v, 1, h, w))               # [B*V, feat_dim]
+        prefix = self.projection(feat).view(b, v, self.num_prefix_tokens, self.llm_hidden_size)
+
+        if self.view_embedding is not None:
+            view_ids = torch.arange(v, device=mask.device)
+            prefix = prefix + self.view_embedding(view_ids)[None, :, None, :]
+
+        if self.presence_embedding is not None:
+            if has_mask is None:
+                has_mask = torch.ones(b, v, dtype=torch.bool, device=mask.device)
+            prefix = prefix + self.presence_embedding(has_mask.long())[:, :, None, :]
+
+        return prefix.reshape(b, v * self.num_prefix_tokens, self.llm_hidden_size)
