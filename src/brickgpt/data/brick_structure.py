@@ -164,6 +164,14 @@ class BrickStructure:
         self.voxel_occupancy[brick.slice] -= 1
         self.bricks.pop()
 
+    def top_down_mask(self, axis: int = 2) -> np.ndarray:
+        """
+        Projects the structure's occupancy grid onto a 2D binary silhouette along the given axis.
+        :param axis: The axis to project along (default 2, i.e. a Z-axis top-down view giving an (x, y) mask).
+        :return: A binary float32 array of shape (world_dim, world_dim) where 1 marks an occupied cell.
+        """
+        return (self.voxel_occupancy.sum(axis=axis) > 0).astype(np.float32)
+
     def has_out_of_bounds_bricks(self) -> bool:
         return any(not self.brick_in_bounds(brick) for brick in self.bricks)
 

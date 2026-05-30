@@ -24,3 +24,8 @@ gurobi.lic
 output.png
 output.txt
 output.ldr
+sample.png
+
+# Other files
+CLAUDE.md
+TODO.md

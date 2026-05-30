@@ -126,6 +126,7 @@ dependencies = [
     { name = "peft" },
     { name = "pillow" },
     { name = "torch" },
+    { name = "torchvision" },
     { name = "transformers" },
 ]
 
@@ -149,6 +150,7 @@ requires-dist = [
     { name = "peft" },
     { name = "pillow" },
     { name = "torch" },
+    { name = "torchvision" },
     { name = "transformers" },
     { name = "trl", marker = "extra == 'finetuning'" },
     { name = "wandb", marker = "extra == 'finetuning'" },

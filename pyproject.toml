@@ -15,6 +15,7 @@ dependencies = [
     "peft",
     "pillow",
     "torch",
+    "torchvision",
     "transformers",
 ]
 
@@ -27,7 +28,9 @@ finetuning = [
 [project.scripts]
 infer = "brickgpt.infer:main"
 prepare_finetuning_dataset = "brickgpt.prepare_finetuning_dataset:main"
+prepare_mask_dataset = "brickgpt.prepare_mask_dataset:main"
 render_bricks = "brickgpt.render_bricks:main"
+visualize_sample = "brickgpt.visualize_sample:main"
 
 [build-system]
 requires = ["hatchling"]
