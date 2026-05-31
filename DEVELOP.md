@@ -4,7 +4,7 @@
 
 ```bash
 pip install uv                  # if uv missing
-huggingface-cli login           # needs Llama-3.2-1B-Instruct access
+huggingface-cli login           # needs Llama-3.2-1B-Instruct access, try 'hf auth login' if didn't work
 uv venv
 uv sync                         # add --extra finetuning if needed
 git submodule update --init
@@ -13,8 +13,8 @@ git submodule update --init
 Download LDraw parts library into the repo (shared across hosts):
 
 ```bash
-wget https://library.ldraw.org/library/updates/complete.zip
-unzip complete.zip && rm complete.zip   # creates ./ldraw/
+wget https://library.ldraw.org/library/updates/complete.zip                 # try "curl -O https://library.ldraw.org/library/updates/complete.zip" in windows w/ git bash
+unzip complete.zip && rm complete.zip   # creates ./ldraw/                        "unzip complete.zip -d ldraw"
 ```
 
 Download background exr (Google Drive) into `ImportLDraw/loadldraw/`:
@@ -27,7 +27,7 @@ gdown 1Yux0sEqWVpXGMT9Z5J094ISfvxhH-_5K -O ImportLDraw/loadldraw/background.exr
 ## Usage (every session)
 
 ```bash
-source .venv/bin/activate
+source .venv/bin/activate                                                   # source .venv/Scripts/activate
 export LDRAW_LIBRARY_PATH="$(pwd)/ldraw"
 export GRB_LICENSE_FILE="$(pwd)/gurobi.lic"   # optional, for Gurobi
 ```

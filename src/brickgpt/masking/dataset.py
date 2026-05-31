@@ -27,6 +27,9 @@ class MaskBrickDataset(Dataset):
     absent. The number of kept views is sampled from ``cfg.view_keep_probs`` (biased toward a single
     provided view to match single-view inference); which views are kept is uniform. The presence
     flags are used later for per-view IoU reward routing and for the encoder's presence embedding.
+    
+    If precomputed multiview prefix tokens are provided, they will be included in the output dict
+    and can be used directly by the model instead of computing them on-the-fly.
     """
 
     def __init__(
@@ -35,6 +38,7 @@ class MaskBrickDataset(Dataset):
             tokenizer: Any,
             cfg: MaskConditioningConfig = MaskConditioningConfig(),
             masks: np.ndarray | None = None,
+            prefixes: np.ndarray | None = None,
             train: bool = True,
             system_prompt: str = 'You are a helpful assistant.',
     ):
@@ -46,12 +50,16 @@ class MaskBrickDataset(Dataset):
                       (``V == len(cfg.views)``), indexed by row, as written by
                       :mod:`brickgpt.prepare_mask_dataset`. If ``None``, masks are projected on the
                       fly from ``bricks``.
+        :param prefixes: Optional precomputed multiview prefix tokens of shape 
+                         ``(num_rows, V*num_prefix_tokens, llm_hidden_size)``, indexed by row.
+                         If provided, these are used instead of computing prefix tokens from masks.
         :param train: If ``True``, applies per-view condition dropout in ``__getitem__``.
         :param system_prompt: System message used to build the conversation.
         """
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.masks = masks
+        self.prefixes = prefixes
         self.train = train
         self.system_prompt = system_prompt
 
@@ -77,6 +85,12 @@ class MaskBrickDataset(Dataset):
         if self.masks is not None:
             return np.asarray(self.masks[row_idx], dtype=np.float32)
         return stack_views(self.bricks[row_idx], self.cfg)
+
+    def _get_prefix(self, row_idx: int) -> np.ndarray | None:
+        """Returns precomputed ``[V*num_prefix_tokens, llm_hidden_size]`` prefix tokens, if available."""
+        if self.prefixes is not None:
+            return np.asarray(self.prefixes[row_idx], dtype=np.float32)
+        return None
 
     def _sample_presence(self) -> np.ndarray:
         """Per-view condition dropout (D2): which views to keep. Returns a ``[V]`` bool array."""
@@ -116,13 +130,20 @@ class MaskBrickDataset(Dataset):
         for j in range(min(len(prompt_ids), len(labels))):
             labels[j] = -100
 
-        return {
+        out = {
             'input_ids': torch.tensor(full_ids, dtype=torch.long),
             'attention_mask': torch.ones(len(full_ids), dtype=torch.long),
             'labels': torch.tensor(labels, dtype=torch.long),
             'mask': torch.from_numpy(np.ascontiguousarray(views)).float(),  # [V, H, W]
             'has_mask': torch.from_numpy(presence),                         # [V] bool
         }
+        
+        # Optionally include precomputed prefix tokens
+        prefix = self._get_prefix(row_idx)
+        if prefix is not None:
+            out['prefix_embeds'] = torch.from_numpy(prefix).float()  # [V*num_prefix_tokens, D]
+
+        return out
 
 
 class MaskDataCollator:
@@ -133,6 +154,9 @@ class MaskDataCollator:
     stacks the per-example mask stacks (``[B, V, H, W]``) and presence flags (``[B, V]``). The mask
     prefix tokens are prepended (with ``-100`` labels) inside the model's forward pass, not here, so
     the text labels stay aligned with the text.
+    
+    If precomputed prefix tokens are available in the examples, they are stacked and included in the
+    output batch as ``prefix_embeds`` (``[B, V*num_prefix_tokens, llm_hidden_size]``).
     """
 
     def __init__(self, pad_token_id: int, label_pad_id: int = -100):
@@ -149,10 +173,16 @@ class MaskDataCollator:
             attention_mask.append(F.pad(f['attention_mask'], (0, pad), value=0))
             labels.append(F.pad(f['labels'], (0, pad), value=self.label_pad_id))
 
-        return {
+        out = {
             'input_ids': torch.stack(input_ids),
             'attention_mask': torch.stack(attention_mask),
             'labels': torch.stack(labels),
             'mask': torch.stack([f['mask'] for f in features]),          # [B, V, H, W]
             'has_mask': torch.stack([f['has_mask'] for f in features]),  # [B, V] bool
         }
+        
+        # Optionally include precomputed prefix tokens if they're in all examples
+        if all('prefix_embeds' in f for f in features):
+            out['prefix_embeds'] = torch.stack([f['prefix_embeds'] for f in features])  # [B, V*T, D]
+        
+        return out

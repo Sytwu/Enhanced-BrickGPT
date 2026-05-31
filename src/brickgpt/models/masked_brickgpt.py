@@ -60,13 +60,31 @@ class BrickGPTWithMask(nn.Module):
             labels: torch.Tensor | None = None,
             mask: torch.Tensor | None = None,
             has_mask: torch.Tensor | None = None,
+            prefix_embeds: torch.Tensor | None = None,
             **kwargs,
     ):
-        if mask is None:
-            raise ValueError('BrickGPTWithMask.forward requires a `mask` tensor of shape (B, V, H, W).')
+        """
+        Forward pass for the masked BrickGPT model.
+        
+        :param input_ids: Tokenized text input of shape ``(B, S)``.
+        :param attention_mask: Attention mask of shape ``(B, S)``.
+        :param labels: Optional labels for training of shape ``(B, S)``.
+        :param mask: Optional mask stack of shape ``(B, V, H, W)`` to compute prefix embeddings on-the-fly.
+        :param has_mask: Optional presence flags of shape ``(B, V)``.
+        :param prefix_embeds: Optional precomputed prefix embeddings of shape ``(B, V*num_prefix_tokens, D)``.
+                              If provided, these are used directly instead of computing from masks.
+        """
+        # Determine source of prefix embeddings: precomputed or computed from masks
+        if prefix_embeds is not None:
+            # Use precomputed prefix tokens
+            prefix_embeds = prefix_embeds.to(self.base.get_input_embeddings().weight.dtype)
+        elif mask is not None:
+            # Compute prefix tokens from masks
+            prefix_embeds = self.prefix_embeds(mask, has_mask).to(self.base.get_input_embeddings().weight.dtype)
+        else:
+            raise ValueError('BrickGPTWithMask.forward requires either `mask` or `prefix_embeds`.')
 
         text_embeds = self.base.get_input_embeddings()(input_ids)                       # [B, S, D]
-        prefix_embeds = self.prefix_embeds(mask, has_mask).to(text_embeds.dtype)         # [B, T, D]
         inputs_embeds = torch.cat([prefix_embeds, text_embeds], dim=1)
 
         bsz, num_prefix = prefix_embeds.shape[:2]

@@ -56,6 +56,22 @@ class MaskConditioningConfig:
         default=1024,
         metadata={'help': 'Hidden dimension of the 2-layer projection MLP.'},
     )
+    encoder_resize_mode: str = field(
+        default='nearest',
+        metadata={'help': 'Interpolation mode used to resize the input mask before the CNN encoder.'},
+    )
+    normalize_mask: bool = field(
+        default=True,
+        metadata={'help': 'Whether to normalize the single-channel mask before the CNN encoder.'},
+    )
+    mask_mean: float = field(
+        default=0.5,
+        metadata={'help': 'Mean value used for mask normalization.'},
+    )
+    mask_std: float = field(
+        default=0.5,
+        metadata={'help': 'Std value used for mask normalization.'},
+    )
     condition_dropout_p: float = field(
         default=0.3,
         metadata={'help': 'DEPRECATED (single-view). Kept for backward compatibility; the 3-view dataset '

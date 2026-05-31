@@ -8,7 +8,11 @@ from .config import MaskConditioningConfig
 # Output feature dimension of the supported torchvision backbones (after replacing the classifier).
 _BACKBONE_FEATURE_DIM = {
     'resnet18': 512,
+    'resnet34': 512,
+    'resnet50': 2048,
 }
+
+_SUPPORTED_RESIZE_MODES = {'nearest', 'bilinear', 'bicubic', 'area'}
 
 
 class MaskEncoder(nn.Module):
@@ -26,8 +30,18 @@ class MaskEncoder(nn.Module):
         if cfg.backbone not in _BACKBONE_FEATURE_DIM:
             raise ValueError(f'Unsupported mask-encoder backbone: {cfg.backbone!r}. '
                              f'Supported: {sorted(_BACKBONE_FEATURE_DIM)}')
+        if cfg.encoder_resize_mode not in _SUPPORTED_RESIZE_MODES:
+            raise ValueError(
+                f'Unsupported encoder_resize_mode: {cfg.encoder_resize_mode!r}. '
+                f'Supported: {sorted(_SUPPORTED_RESIZE_MODES)}'
+            )
+
         self.feature_dim = _BACKBONE_FEATURE_DIM[cfg.backbone]
         self.input_size = cfg.encoder_input_size
+        self.resize_mode = cfg.encoder_resize_mode
+        self.normalize_mask = cfg.normalize_mask
+        self.register_buffer('mask_mean', torch.tensor(cfg.mask_mean, dtype=torch.float32).view(1, 1, 1, 1))
+        self.register_buffer('mask_std', torch.tensor(cfg.mask_std, dtype=torch.float32).view(1, 1, 1, 1))
 
         weights = 'DEFAULT' if cfg.pretrained_backbone else None
         net = getattr(torchvision.models, cfg.backbone)(weights=weights)
@@ -57,7 +71,10 @@ class MaskEncoder(nn.Module):
         """
         if mask.dim() != 4 or mask.size(1) != 1:
             raise ValueError(f'Expected mask of shape (B, 1, H, W), got {tuple(mask.shape)}')
-        mask = F.interpolate(mask, size=(self.input_size, self.input_size), mode='nearest')
+        mask = mask.to(dtype=torch.float32)
+        mask = F.interpolate(mask, size=(self.input_size, self.input_size), mode=self.resize_mode)
+        if self.normalize_mask:
+            mask = (mask - self.mask_mean) / self.mask_std
         return self.net(mask)
 
 
