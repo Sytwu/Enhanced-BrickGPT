@@ -9,7 +9,7 @@ import logging
 import numpy as np
 import torch
 
-from brickgpt.masking import MaskConditioningConfig, stack_views
+from brickgpt.masking import MaskConditioningConfig, MaskBrickDataset, MaskDataCollator, stack_views
 from brickgpt.models.brickgpt import BrickGPT, BrickGPTConfig
 from brickgpt.models.llm import LLM
 from brickgpt.training.rewards import silhouette_iou_from_structure, _valid_bricks
@@ -81,3 +81,59 @@ def iou_probe(
     iou_null = float(np.mean(null_ious)) if null_ious else 0.0
     return {'iou_masked': iou_masked, 'iou_null': iou_null,
             'iou_lift': iou_masked - iou_null, 'n': float(len(eval_examples))}
+
+
+@torch.no_grad()
+def ce_delta_probe(
+        masked_model,
+        tokenizer,
+        eval_examples: list[dict],
+        mask_cfg: MaskConditioningConfig,
+) -> dict[str, float]:
+    """
+    Teacher-forced companion to :func:`iou_probe`: a cheap, low-variance signal that the encoder is
+    informative, runnable every few steps (no generation).
+
+    For each held-out ``(caption, bricks)``, compute the assistant-only cross-entropy of the GT brick
+    tokens twice -- once conditioned on the GT silhouette, once on a null (absent) mask -- and report
+    the drop. ``ce_delta = ce_null - ce_masked > 0`` means the mask lowers the loss (the prefix carries
+    signal); it tends to rise *before* the generation-based ``iou_lift``, so it is the earliest
+    evidence that a frozen-LLM SFT run is actually learning to use the mask.
+
+    Reuses the training data path (:class:`~brickgpt.masking.MaskBrickDataset` in eval mode -> all
+    views present, no caption dropout) so the tokenization / assistant-only labels match training
+    exactly. One example per forward (no padding); CE is token-weighted across examples.
+
+    :param eval_examples: rows with ``captions`` (list) and ``bricks`` (str).
+    :return: ``{'ce_masked', 'ce_null', 'ce_delta', 'n'}`` -- token-weighted CE means and ``n``, the
+             number of (flattened) caption examples scored.
+    """
+    was_training = masked_model.training
+    masked_model.eval()
+    device = next(masked_model.parameters()).device
+
+    ds = MaskBrickDataset(eval_examples, tokenizer, mask_cfg, train=False)
+    collate = MaskDataCollator(pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
+
+    masked_sum = null_sum = tok_sum = 0.0
+    for i in range(len(ds)):
+        batch = {k: v.to(device) for k, v in collate([ds[i]]).items()}
+        n_tok = int((batch['labels'] != -100).sum())   # == HF's loss denominator (assistant tokens)
+        if n_tok == 0:
+            continue
+        masked_loss = float(masked_model(**batch, use_cache=False).loss)
+        null_batch = {**batch, 'mask': torch.zeros_like(batch['mask']),
+                      'has_mask': torch.zeros_like(batch['has_mask'])}
+        null_loss = float(masked_model(**null_batch, use_cache=False).loss)
+        masked_sum += masked_loss * n_tok
+        null_sum += null_loss * n_tok
+        tok_sum += n_tok
+
+    if was_training:
+        masked_model.train()
+
+    if tok_sum == 0:
+        return {'ce_masked': 0.0, 'ce_null': 0.0, 'ce_delta': 0.0, 'n': 0.0}
+    ce_masked, ce_null = masked_sum / tok_sum, null_sum / tok_sum
+    return {'ce_masked': ce_masked, 'ce_null': ce_null,
+            'ce_delta': ce_null - ce_masked, 'n': float(len(ds))}

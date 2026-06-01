@@ -4,11 +4,13 @@ from brickgpt.data import BrickStructure
 from brickgpt.masking import MaskConditioningConfig, stack_views
 from brickgpt.training import (
     RewardConfig, syntax_reward, overlap_penalty, stability_reward_from_structure,
-    silhouette_iou_from_structure, normalize_clip_score, compute_reward,
+    silhouette_iou_from_structure, normalize_clip_score, compute_reward, stepwise_rewards,
 )
+from brickgpt.training.grpo_masked import compute_stepwise_advantages
 from brickgpt.training.rewards import _valid_bricks
 
 MCFG = MaskConditioningConfig()
+STEP_CFG = RewardConfig(use_multi_turn=True, use_iou=False, use_semantic=False)
 
 
 def _structure(text):
@@ -140,3 +142,76 @@ def test_breakdown_components_excludes_none():
     b = compute_reward(text, target, [True, True, True], cfg=RewardConfig(), mask_cfg=MCFG)
     comps = b.components()
     assert set(comps) == {'overlap', 'stability', 'iou'}   # semantic off -> excluded
+
+
+# --- multi-turn: per-brick step rewards (step-only) ----------------------------------------------
+
+def test_stepwise_two_stable_bricks():
+    # Stability is terminal: only the last committed brick carries it; overlap stays per-brick.
+    steps = stepwise_rewards(['2x6 (0,0,0)', '2x6 (2,0,0)'], STEP_CFG, MCFG)
+    assert [s.syntax_ok for s in steps] == [True, True]
+    assert [s.overlap for s in steps] == [0.0, 0.0]
+    assert [s.stability for s in steps] == [None, 1.0]
+    assert [s.total for s in steps] == pytest.approx([0.0, 1.0])
+
+
+def test_stepwise_incremental_overlap():
+    # Second identical brick adds 4 overlapping voxels -> Δoverlap = -4; terminal stability +1 on it.
+    steps = stepwise_rewards(['2x2 (0,0,0)', '2x2 (0,0,0)'], STEP_CFG, MCFG)
+    assert steps[0].total == pytest.approx(0.0)     # overlap 0, stability deferred to terminal
+    assert steps[1].overlap == pytest.approx(-4.0)
+    assert steps[1].stability == 1.0
+    assert steps[1].total == pytest.approx(-3.0)    # -4 (Δoverlap) + 1 (terminal stability)
+
+
+def test_stepwise_invalid_line_gated_and_not_added():
+    steps = stepwise_rewards(['2x6 (0,0,0)', 'garbage', '2x6 (2,0,0)'], STEP_CFG, MCFG)
+    assert steps[1].total == -1.0 and steps[1].syntax_ok is False
+    assert steps[1].overlap is None and steps[1].stability is None
+    # The third brick is scored against {brick0, brick2} -- not poisoned by the bad middle line, and
+    # carries the terminal stability (it is the last committed brick).
+    assert steps[2].syntax_ok is True
+    assert steps[2].overlap == pytest.approx(0.0)
+    assert steps[2].stability == 1.0
+
+
+def test_stepwise_floating_brick():
+    steps = stepwise_rewards(['2x6 (0,0,0)', '2x6 (2,0,1)'], STEP_CFG, MCFG)
+    assert steps[0].stability is None              # stability deferred to the terminal step
+    assert steps[1].stability == -1.0              # final structure has a floating layer-1 brick
+    assert steps[1].total == pytest.approx(-1.0)
+
+
+def test_stepwise_terminal_stability_is_order_robust():
+    # Roof-first build: the layer-1 brick is placed before its layer-0 support. A per-step check would
+    # wrongly flag the first prefix as floating; the terminal check only judges the *final* structure,
+    # which is fully grounded -> +1 on the last brick, 0 on the first.
+    steps = stepwise_rewards(['2x6 (0,0,1)', '2x6 (0,0,0)'], STEP_CFG, MCFG)
+    assert steps[0].stability is None and steps[0].total == pytest.approx(0.0)
+    assert steps[1].stability == 1.0 and steps[1].total == pytest.approx(1.0)
+
+
+def test_stepwise_skips_empty_lines():
+    steps = stepwise_rewards(['2x6 (0,0,0)', '', '2x6 (2,0,0)'], STEP_CFG, MCFG)
+    # An empty line cannot parse -> gated -1, but does not corrupt the running structure.
+    assert [s.syntax_ok for s in steps] == [True, False, True]
+    assert steps[2].stability == 1.0
+
+
+# --- multi-turn: per-step (per-turn) advantages --------------------------------------------------
+
+def test_stepwise_advantages_shapes_and_per_step_baseline():
+    # Trajectories of lengths 3, 3, 1. gamma=1 -> G_t = sum of remaining step rewards.
+    step_rewards = [[1.0, 1.0, 1.0], [1.0, -1.0, 1.0], [1.0]]
+    A = compute_stepwise_advantages(step_rewards, gamma=1.0)
+    assert [len(a) for a in A] == [3, 3, 1]                 # ragged shape preserved
+    # Step index 0 standardized across all 3 trajectories -> column sums to ~0.
+    assert A[0][0] + A[1][0] + A[2][0] == pytest.approx(0.0, abs=1e-6)
+    # Step index 1: only trajectories 0 and 1 reach it -> 2-sample baseline, opposite signs.
+    assert A[0][1] == pytest.approx(-A[1][1])
+
+
+def test_stepwise_advantages_singleton_step_is_zero():
+    # Only one trajectory reaches step index 1 -> no group signal -> advantage 0 there.
+    A = compute_stepwise_advantages([[1.0, 2.0], [1.0]], gamma=1.0)
+    assert A[0][1] == 0.0

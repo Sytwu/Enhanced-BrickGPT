@@ -1,16 +1,26 @@
 """
-Step E -- Phase 2 GRPO post-training for mask-conditioned BrickGPT (self-written single-turn loop).
+Step E -- Phase 2 GRPO post-training for mask-conditioned BrickGPT (self-written loop).
 
 Stage 2 (D7): load the SFT mask encoder, **freeze it**, attach **LoRA to the LLM**, and optimize the
 reward (:class:`~brickgpt.training.rewards.RewardConfig`) with group-relative advantages and a KL
 penalty to the frozen reference policy (the same model with the LoRA adapter disabled -- no separate
 copy needed).
 
-Single-turn (D5): each prompt yields one completion = the whole brick list -> one scalar reward.
-Unlike text-only BrickGPT inference, rollouts here generate the **full completion in one pass** from
-the mask-prefilled cache (no per-brick rejection / no logit masking), so (a) syntax/overlap/stability
-give real reward signal (the curriculum's Phase A) and (b) teacher-forced log-probs match the
-sampling policy exactly. Validity is shaped by the reward (syntax gate), not enforced by the decoder.
+Rollouts (both modes) generate the **full completion in one pass** from the mask-prefilled cache (no
+per-brick rejection / no logit masking), so (a) syntax/overlap/stability give real reward signal and
+(b) teacher-forced log-probs match the sampling policy exactly. Validity is shaped by the reward
+(syntax gate), not enforced by the decoder.
+
+Two advantage granularities:
+
+* **Single-turn (D5, default):** one completion = the whole brick list -> one scalar reward ->
+  one group-relative advantage broadcast over all of its tokens.
+* **Multi-turn (``--use_multi_turn``):** the completion is split on newline tokens into per-brick
+  turns; each brick gets a per-step syntax + overlap reward, with **stability scored once on the final
+  structure** and attached to the last brick (a causal per-step check can't see a support that arrives
+  in a later turn). A discounted return-to-go then gives each brick a **per-step** advantage on just
+  its token span -- finer credit assignment for which brick collided / broke the build. IoU/semantic
+  are unavailable here (they need a complete trajectory) and are forced off.
 
 A custom loop (not ``trl.GRPOTrainer``) is required: GRPOTrainer assumes text prompts and a fixed
 reward signature, which fights both the prefix-embed injection and the per-view NULL-mask routing.
@@ -31,7 +41,7 @@ import torch
 from brickgpt.masking import MaskConditioningConfig, stack_views
 from brickgpt.models.masked_brickgpt import BrickGPTWithMask
 from brickgpt.training.logging_utils import RunLogger
-from brickgpt.training.rewards import RewardConfig, compute_reward
+from brickgpt.training.rewards import RewardConfig, compute_reward, stepwise_rewards
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +78,11 @@ class GRPOMaskedArguments:
     use_iou: bool = field(default=True)
     use_semantic: bool = field(default=False)
 
+    # Multi-turn (D5): per-brick step rewards + per-step (per-turn) advantages. Step-only by contract
+    # -- IoU/semantic need a full trajectory and are forced off when this is set.
+    use_multi_turn: bool = field(default=False)
+    gamma: float = field(default=1.0, metadata={'help': 'Discount for per-brick return-to-go (multi-turn).'})
+
     report_to: str = field(default='auto')
     wandb_project: str = field(default='brickgpt-mask-grpo')
     run_name: str | None = field(default=None)
@@ -78,6 +93,72 @@ class GRPOMaskedArguments:
 def compute_group_advantages(rewards: torch.Tensor) -> torch.Tensor:
     """GRPO advantage: standardize rewards within the sampled group ``(r - mean) / (std + eps)``."""
     return (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+
+def compute_stepwise_advantages(step_rewards: list[list[float]], gamma: float) -> list[list[float]]:
+    """
+    Per-brick (per-turn) GRPO advantages for the multi-turn path.
+
+    For each trajectory, compute the discounted **return-to-go** ``G_t = r_t + gamma * G_{t+1}``; then
+    standardize **per step index** across the group -- at index ``t`` only over the trajectories that
+    actually have a ``t``-th brick. This per-index baseline removes the positional bias whereby earlier
+    bricks have systematically larger returns-to-go. A step reached by ``< 2`` trajectories gets
+    advantage ``0`` (no group signal there).
+
+    :param step_rewards: One list of per-brick step rewards per trajectory (ragged across trajectories).
+    :return: Same ragged shape; ``advantages[g][t]`` is the advantage for brick ``t`` of trajectory ``g``.
+    """
+    returns: list[list[float]] = []
+    for rs in step_rewards:
+        g = [0.0] * len(rs)
+        acc = 0.0
+        for t in range(len(rs) - 1, -1, -1):
+            acc = rs[t] + gamma * acc
+            g[t] = acc
+        returns.append(g)
+
+    advantages = [[0.0] * len(g) for g in returns]
+    max_t = max((len(g) for g in returns), default=0)
+    for t in range(max_t):
+        idx = [i for i in range(len(returns)) if len(returns[i]) > t]
+        if len(idx) < 2:
+            continue
+        vals = np.array([returns[i][t] for i in idx], dtype=np.float64)
+        mean, std = vals.mean(), vals.std()
+        for i, v in zip(idx, vals):
+            advantages[i][t] = float((v - mean) / (std + 1e-8))
+    return advantages
+
+
+def _brick_token_spans(gen_ids: torch.Tensor, tokenizer) -> list[tuple[int, int, str]]:
+    """
+    Split a 1-D ``gen_ids`` into per-brick ``(start, end, line_text)`` spans on newline tokens.
+
+    A turn boundary is a generated token whose decoded text contains ``\\n`` (the brick format ends each
+    line with a single ``)\\n`` token). Generation stops at ``eos_token_id``; a trailing non-empty run
+    with no closing newline is emitted as a final span too (typically gated to ``-1`` by the syntax
+    check). Empty segments are dropped, so the spans align 1:1 with the lines fed to
+    :func:`~brickgpt.training.rewards.stepwise_rewards`. Indices are into ``gen_ids`` so they line up
+    with the per-token log-probs from :func:`_sequence_logprobs`.
+    """
+    eos = tokenizer.eos_token_id
+    ids = gen_ids.tolist()
+    spans: list[tuple[int, int, str]] = []
+    start, buf = 0, []
+    for i, tid in enumerate(ids):
+        if tid == eos:
+            break
+        buf.append(tid)
+        if '\n' in tokenizer.decode([tid]):
+            text = tokenizer.decode(buf, skip_special_tokens=True).strip()
+            if text:
+                spans.append((start, i + 1, text))
+            start, buf = i + 1, []
+    if buf:  # trailing tokens with no closing newline (or stopped by EOS / max tokens)
+        text = tokenizer.decode(buf, skip_special_tokens=True).strip()
+        if text:
+            spans.append((start, start + len(buf), text))
+    return spans
 
 
 def _sequence_logprobs(base, prefix_embeds, prompt_ids, gen_ids) -> torch.Tensor:
@@ -166,8 +247,15 @@ def main():
     from transformers import AutoTokenizer, HfArgumentParser
     (args,) = HfArgumentParser(GRPOMaskedArguments).parse_args_into_dataclasses()
     cfg = MaskConditioningConfig()
-    reward_cfg = RewardConfig(use_overlap=args.use_overlap, use_stability=args.use_stability,
-                              use_iou=args.use_iou, use_semantic=args.use_semantic)
+    if args.use_multi_turn:
+        if args.use_iou or args.use_semantic:
+            logger.warning('Multi-turn GRPO is step-only; forcing use_iou/use_semantic off '
+                           '(they need a complete trajectory).')
+        reward_cfg = RewardConfig(use_multi_turn=True, use_overlap=args.use_overlap,
+                                  use_stability=args.use_stability, use_iou=False, use_semantic=False)
+    else:
+        reward_cfg = RewardConfig(use_overlap=args.use_overlap, use_stability=args.use_stability,
+                                  use_iou=args.use_iou, use_semantic=args.use_semantic)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -196,28 +284,44 @@ def main():
             prefix_embeds = model.mask_prefix_encoder(mask_t, has_mask_t).to(next(model.base.parameters()).dtype)
 
         completions = rollout(model, tokenizer, prefix_embeds, prompt_ids, args, device)
-        breakdowns = [compute_reward(text, target, presence, cfg=reward_cfg, mask_cfg=cfg)
-                      for _, text in completions]
-        rewards = torch.tensor([b.total for b in breakdowns], dtype=torch.float32, device=device)
-        advantages = compute_group_advantages(rewards)
+
+        # Reward + advantage. Single-turn: one scalar reward / advantage per completion. Multi-turn:
+        # per-brick step rewards split on newline tokens, with a per-step advantage per token span.
+        if args.use_multi_turn:
+            spans_per = [_brick_token_spans(gen_ids, tokenizer) for gen_ids, _ in completions]
+            steps_per = [stepwise_rewards([t for _, _, t in spans], reward_cfg, cfg) for spans in spans_per]
+            step_r = [[s.total for s in steps] for steps in steps_per]
+            adv_per = compute_stepwise_advantages(step_r, args.gamma)
+            returns = torch.tensor([float(sum(r)) for r in step_r], dtype=torch.float32, device=device)
+        else:
+            breakdowns = [compute_reward(text, target, presence, cfg=reward_cfg, mask_cfg=cfg)
+                          for _, text in completions]
+            returns = torch.tensor([b.total for b in breakdowns], dtype=torch.float32, device=device)
+            scalar_adv = compute_group_advantages(returns)
 
         # Policy + reference log-probs; GRPO loss = -A * logp + beta * KL(policy || ref), token-mean.
         opt.zero_grad(set_to_none=True)
         pg_terms, kl_terms = [], []
-        for (gen_ids, _), adv in zip(completions, advantages):
+        for g, (gen_ids, _) in enumerate(completions):
             if gen_ids.numel() == 0:
                 continue
-            gen_ids = gen_ids.unsqueeze(0).to(device)
-            logp = _sequence_logprobs(embed_base, prefix_embeds, prompt_ids, gen_ids)
+            gen_ids_b = gen_ids.unsqueeze(0).to(device)
+            logp = _sequence_logprobs(embed_base, prefix_embeds, prompt_ids, gen_ids_b)
             with torch.no_grad():
                 with model.base.disable_adapter():
-                    ref_logp = _sequence_logprobs(embed_base, prefix_embeds, prompt_ids, gen_ids)
+                    ref_logp = _sequence_logprobs(embed_base, prefix_embeds, prompt_ids, gen_ids_b)
             kl = torch.exp(ref_logp - logp) - (ref_logp - logp) - 1.0  # k3 estimator, per token
+            if args.use_multi_turn:  # per-token advantage: brick t's span carries A_t, else 0
+                adv = torch.zeros(logp.shape[0], dtype=logp.dtype, device=device)
+                for (s, e, _t), a in zip(spans_per[g], adv_per[g]):
+                    adv[s:e] = a
+            else:
+                adv = scalar_adv[g]
             pg_terms.append(-(adv * logp).mean())
             kl_terms.append(kl.mean())
 
         if not pg_terms:
-            run.log({'reward': rewards.mean().item(), 'skipped': 1.0}, step=step)
+            run.log({'reward': returns.mean().item(), 'skipped': 1.0}, step=step)
             continue
         pg_loss = torch.stack(pg_terms).mean()
         kl_loss = torch.stack(kl_terms).mean()
@@ -226,14 +330,24 @@ def main():
         torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         opt.step()
 
-        metrics = {'reward': rewards.mean().item(), 'reward_std': rewards.std().item(),
-                   'adv_abs': advantages.abs().mean().item(), 'loss': loss.item(),
-                   'pg_loss': pg_loss.item(), 'kl': kl_loss.item(),
-                   'syntax_ok': float(np.mean([b.syntax_ok for b in breakdowns]))}
-        for key in ('overlap', 'stability', 'iou', 'semantic'):
-            vals = [getattr(b, key) for b in breakdowns if getattr(b, key) is not None]
-            if vals:
-                metrics[key] = float(np.mean(vals))
+        metrics = {'reward': returns.mean().item(), 'reward_std': returns.std().item(),
+                   'loss': loss.item(), 'pg_loss': pg_loss.item(), 'kl': kl_loss.item()}
+        if args.use_multi_turn:
+            all_steps = [s for steps in steps_per for s in steps]
+            metrics['bricks_per_traj'] = float(np.mean([len(steps) for steps in steps_per]))
+            metrics['step_reward'] = float(np.mean([s.total for s in all_steps])) if all_steps else 0.0
+            metrics['syntax_ok'] = float(np.mean([s.syntax_ok for s in all_steps])) if all_steps else 0.0
+            for key in ('overlap', 'stability'):
+                vals = [getattr(s, key) for s in all_steps if getattr(s, key) is not None]
+                if vals:
+                    metrics[key] = float(np.mean(vals))
+        else:
+            metrics['adv_abs'] = scalar_adv.abs().mean().item()
+            metrics['syntax_ok'] = float(np.mean([b.syntax_ok for b in breakdowns]))
+            for key in ('overlap', 'stability', 'iou', 'semantic'):
+                vals = [getattr(b, key) for b in breakdowns if getattr(b, key) is not None]
+                if vals:
+                    metrics[key] = float(np.mean(vals))
         run.log(metrics, step=step)
 
         if args.save_every and step % args.save_every == 0:

@@ -29,7 +29,7 @@ from transformers import AutoTokenizer, HfArgumentParser, get_cosine_schedule_wi
 from brickgpt.masking import MaskConditioningConfig, MaskBrickDataset, MaskDataCollator
 from brickgpt.models.brickgpt import BrickGPTConfig
 from brickgpt.models.masked_brickgpt import BrickGPTWithMask
-from brickgpt.training.generation import iou_probe
+from brickgpt.training.generation import ce_delta_probe, iou_probe
 from brickgpt.training.logging_utils import RunLogger
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,13 @@ class SFTMaskedArguments:
     train_split: str = field(default='train')
     probe_split: str = field(default='test')
     output_dir: str = field(default='output/sft_masked')
+
+    caption_dropout_p: float = field(
+        default=0.0,
+        metadata={'help': 'CFG-style text dropout (see MaskConditioningConfig.caption_dropout_p). '
+                          'Makes the mask non-redundant so the encoder gets gradient even with a frozen '
+                          'LLM that already fits caption->bricks. Try ~0.5 if the IoU lift / CE delta is ~0.'},
+    )
 
     # Optimization (defaults follow scripts/finetune.zsh: lr=2e-3 cosine, warmup=100, bf16).
     lr: float = field(default=2e-3)
@@ -68,6 +75,12 @@ class SFTMaskedArguments:
     run_name: str | None = field(default=None)
     log_every: int = field(default=50)
     probe_every: int = field(default=500, metadata={'help': 'Run the IoU probe every N optimizer steps (0=off).'})
+    ce_probe_every: int = field(
+        default=100,
+        metadata={'help': 'Run the (cheap, teacher-forced) CE-delta probe every N optimizer steps (0=off). '
+                          'Logs ce_masked/ce_null/ce_delta; a positive, rising ce_delta is the earliest '
+                          'evidence the frozen-LLM encoder is learning to use the mask.'},
+    )
     probe_n: int = field(default=8)
     save_every: int = field(default=1000)
 
@@ -96,7 +109,7 @@ def _save(model, cfg, args, tag):
 def main():
     logging.basicConfig(level=logging.INFO)
     (args,) = HfArgumentParser(SFTMaskedArguments).parse_args_into_dataclasses()
-    cfg = MaskConditioningConfig()
+    cfg = MaskConditioningConfig(caption_dropout_p=args.caption_dropout_p)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -111,9 +124,9 @@ def main():
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                         collate_fn=collator, num_workers=args.num_workers, drop_last=True)
 
-    # Held-out examples for the IoU probe.
+    # Held-out examples shared by both probes (IoU + CE-delta).
     probe_examples = []
-    if args.probe_every:
+    if args.probe_every or args.ce_probe_every:
         try:
             _, probe_data = build_dataset(args, tokenizer, cfg, args.probe_split, train=False)
         except (ValueError, FileNotFoundError, KeyError):
@@ -156,6 +169,11 @@ def main():
             run.log({'loss': running / args.grad_accum_steps, 'lr': sched.get_last_lr()[0]}, step=step)
             running = 0.0
 
+            if args.ce_probe_every and step % args.ce_probe_every == 0 and probe_examples:
+                ce = ce_delta_probe(model, tokenizer, probe_examples, cfg)
+                run.write(f'[sft] step {step} CE probe: masked={ce["ce_masked"]:.4f} '
+                          f'null={ce["ce_null"]:.4f} delta={ce["ce_delta"]:+.4f}')
+                run.log(ce, step=step, advance=0)
             if args.probe_every and step % args.probe_every == 0 and probe_examples:
                 metrics = iou_probe(model, tokenizer, probe_examples, cfg, probe_cfg)
                 run.write(f'[sft] step {step} IoU probe: masked={metrics["iou_masked"]:.3f} '

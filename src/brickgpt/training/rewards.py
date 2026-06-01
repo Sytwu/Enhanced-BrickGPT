@@ -52,6 +52,20 @@ class RewardConfig:
 
 
 @dataclass
+class StepReward:
+    """Per-brick (per-turn) reward for the multi-turn GRPO path (step-only: syntax/overlap/stability).
+
+    ``None`` components mean the term was disabled, or the brick was gated out (invalid / out-of-bounds)
+    before structure-level terms could be computed.
+    """
+    line: str
+    total: float
+    syntax_ok: bool
+    overlap: float | None = None
+    stability: float | None = None
+
+
+@dataclass
 class RewardBreakdown:
     """Per-component reward, for logging (D6). ``None`` means a term was gated/disabled/not applicable."""
     total: float
@@ -69,6 +83,16 @@ class RewardBreakdown:
 
 # --- primitives ----------------------------------------------------------------------------------
 
+def _parse_line(line: str) -> Brick | None:
+    """Parses one brick line; returns the :class:`Brick`, or ``None`` if invalid / not in library."""
+    try:
+        brick = Brick.from_txt(line)
+        _ = brick.brick_id  # raises ValueError if dimensions are not in the library
+    except ValueError:
+        return None
+    return brick
+
+
 def _valid_bricks(bricks_txt: str) -> list[Brick] | None:
     """Parses every non-empty line; returns the brick list, or ``None`` if any line is invalid."""
     bricks = []
@@ -76,10 +100,8 @@ def _valid_bricks(bricks_txt: str) -> list[Brick] | None:
         line = line.strip()
         if not line:
             continue
-        try:
-            brick = Brick.from_txt(line)
-            _ = brick.brick_id  # raises ValueError if dimensions are not in the library
-        except ValueError:
+        brick = _parse_line(line)
+        if brick is None:
             return None
         bricks.append(brick)
     return bricks if bricks else None
@@ -202,3 +224,73 @@ def compute_reward(
 
     return RewardBreakdown(total=total, syntax_ok=True,
                            overlap=overlap, stability=stability, iou=iou, semantic=semantic)
+
+
+# --- multi-turn (per-brick step rewards) ---------------------------------------------------------
+
+def stepwise_rewards(
+        lines: list[str],
+        cfg: RewardConfig = RewardConfig(),
+        mask_cfg: MaskConditioningConfig = MaskConditioningConfig(),
+) -> list[StepReward]:
+    """
+    Per-brick step rewards for the multi-turn GRPO path (D5 / step-level), with stability scored
+    **once at the trajectory end** rather than per brick.
+
+    Step-only by contract -- only the syntax gate, ``overlap`` (per brick), and ``stability`` (terminal)
+    are used; the IoU and semantic terms need a complete trajectory and are *not* computed here (mirrors
+    :meth:`RewardConfig.__post_init__`, which forbids ``use_multi_turn`` with those terms).
+
+    Per line:
+
+    * unparseable / not-in-library -> ``total = -1`` (syntax gate); the brick is **not** added, so a
+      later valid brick is scored against the structure so far (not poisoned by the bad line).
+    * out-of-bounds (``BrickStructure`` rejects it) -> ``total = -1``; not added.
+    * otherwise added to the running structure, with ``total = w_overlap * Δoverlap`` where
+      ``Δoverlap`` is the *incremental* overlap penalty of this brick (so the per-trajectory sum
+      telescopes to the final overlap penalty, matching :func:`compute_reward`'s overlap magnitude).
+
+    **Terminal stability:** stability is a global property a causal per-step check can't judge mid-build
+    (a brick's support may arrive in a later turn), so it is computed *once* on the final structure and
+    added to the **last committed brick's** step. The discounted return-to-go in
+    :func:`~brickgpt.training.grpo_masked.compute_stepwise_advantages` then propagates that signal back
+    to the earlier bricks -- without over-penalizing a not-yet-grounded prefix.
+
+    :param lines: The brick lines of one completion, in generation order (caller splits on newlines).
+    :return: One :class:`StepReward` per input line, in order. Only the terminal step carries a
+             non-``None`` ``stability``.
+    """
+    added: list[Brick] = []
+    prev_overlap = 0.0
+    out: list[StepReward] = []
+    last_committed = -1
+    for line in lines:
+        line = line.strip()
+        brick = _parse_line(line) if line else None
+        if brick is None:
+            out.append(StepReward(line=line, total=-1.0, syntax_ok=False))
+            continue
+        structure = _safe_structure(added + [brick], mask_cfg)
+        if structure is None:  # out-of-bounds: cannot build this brick into the grid
+            out.append(StepReward(line=line, total=-1.0, syntax_ok=False))
+            continue
+
+        total = 0.0
+        overlap = None
+        if cfg.use_overlap:
+            cum_overlap = overlap_penalty(structure)
+            overlap = cum_overlap - prev_overlap          # incremental (<= 0)
+            prev_overlap = cum_overlap
+            total += cfg.w_overlap * overlap
+
+        out.append(StepReward(line=line, total=total, syntax_ok=True, overlap=overlap))
+        added.append(brick)
+        last_committed = len(out) - 1
+
+    # Terminal stability: one global connectivity check on the final structure, attached to the last
+    # committed brick (return-to-go spreads the credit back over the earlier bricks).
+    if cfg.use_stability and last_committed >= 0:
+        stability = stability_reward_from_structure(_safe_structure(added, mask_cfg))
+        out[last_committed].stability = stability
+        out[last_committed].total += cfg.w_stability * stability
+    return out

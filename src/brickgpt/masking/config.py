@@ -85,6 +85,14 @@ class MaskConditioningConfig:
                           'single-view inference distribution, while still seeing all-3 and text-only. '
                           'Which views are kept (given the count) is chosen uniformly.'},
     )
+    caption_dropout_p: float = field(
+        default=0.0,
+        metadata={'help': 'Probability of dropping the text caption during training (set the prompt '
+                          'Input to empty). Classifier-free-guidance-style: makes the mask non-redundant '
+                          'so the encoder gets a gradient signal even when the frozen LLM already fits '
+                          'caption->bricks. When the caption is dropped, at least one view is forced '
+                          'present so the mask is the sole conditioning signal. 0.0 = disabled.'},
+    )
     pretrained_backbone: bool = field(
         default=True,
         metadata={'help': 'Whether to initialize the CNN backbone with pretrained ImageNet weights.'},

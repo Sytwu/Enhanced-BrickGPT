@@ -107,9 +107,18 @@ class MaskBrickDataset(Dataset):
         row_idx, caption = self.index[i]
         bricks_txt = self.bricks[row_idx]
 
-        # Resolve the views, then apply per-view condition dropout: drop -> null mask + absent flag.
+        # Resolve the views and per-view condition dropout: drop -> null mask + absent flag.
         views = self._get_views(row_idx)                  # [V, H, W]
         presence = self._sample_presence()                # [V] bool
+
+        # Caption dropout (CFG-style): with prob caption_dropout_p, blank the text caption so the mask
+        # is non-redundant and the encoder gets a real gradient. Force >=1 view present in that case so
+        # the example is not fully unconditioned (which would carry no conditioning signal at all).
+        if self.train and self.cfg.caption_dropout_p and random.random() < self.cfg.caption_dropout_p:
+            caption = ''
+            if not presence.any():
+                presence[random.randrange(self.cfg.num_views)] = True
+
         views = views * presence[:, None, None].astype(np.float32)
 
         # Build the conversation. The prompt is identical to the text-only model so the LLM's
