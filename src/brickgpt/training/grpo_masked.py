@@ -1,15 +1,19 @@
 """
 Step E -- Phase 2 GRPO post-training for mask-conditioned BrickGPT (self-written loop).
 
-Stage 2 (D7): load the SFT mask encoder, **freeze it**, attach **LoRA to the LLM**, and optimize the
-reward (:class:`~brickgpt.training.rewards.RewardConfig`) with group-relative advantages and a KL
-penalty to the frozen reference policy (the same model with the LoRA adapter disabled -- no separate
-copy needed).
+Stage 2 (D7), **encoder-trainable variant (Path B)**: load the SFT mask encoder, **keep it trainable
+and freeze the LLM**, and optimize the reward (:class:`~brickgpt.training.rewards.RewardConfig`) with
+group-relative advantages. The prefix -- not the LLM -- carries the policy gradient, so IoU is
+optimized by reshaping the mask conditioning directly (this is the CE-SFT plan's intended first RL
+stage). The KL penalty anchors the trained prefix to a **frozen copy of the SFT encoder**: with the
+LLM frozen, the Path-A "disable the LoRA adapter" reference collapses to a no-op (policy == ref), so a
+separate frozen SFT-encoder copy is held as the reference instead.
 
-Rollouts (both modes) generate the **full completion in one pass** from the mask-prefilled cache (no
-per-brick rejection / no logit masking), so (a) syntax/overlap/stability give real reward signal and
-(b) teacher-forced log-probs match the sampling policy exactly. Validity is shaped by the reward
-(syntax gate), not enforced by the decoder.
+Rollouts (both modes) generate the **full completion in one pass** conditioned on the mask prefix
+(prepended as ``inputs_embeds``; eval-mode decode -- see :func:`rollout`), with no per-brick rejection
+and no logit masking, so (a) syntax/overlap/stability give real reward signal and (b) teacher-forced
+log-probs match the sampling policy exactly. Validity is shaped by the reward (syntax gate), not
+enforced by the decoder.
 
 Two advantage granularities:
 
@@ -29,6 +33,7 @@ Run::
 
     uv run train_grpo_masked --sft_checkpoint output/sft_masked --output_dir output/grpo_masked
 """
+import copy
 import json
 import logging
 import os
@@ -63,14 +68,11 @@ class GRPOMaskedArguments:
     temperature: float = field(default=1.0)
     max_steps: int = field(default=2000)
     lr: float = field(default=1e-5)
-    beta_kl: float = field(default=0.04, metadata={'help': 'KL penalty coefficient to the frozen reference.'})
+    beta_kl: float = field(default=0.04, metadata={'help': 'KL penalty coefficient anchoring the trained '
+                                                           'prefix to the frozen SFT-encoder reference. '
+                                                           'Set 0 to disable.'})
     max_grad_norm: float = field(default=1.0)
     gradient_checkpointing: bool = field(default=True)
-
-    lora_r: int = field(default=32)
-    lora_alpha: int = field(default=16)
-    lora_dropout: float = field(default=0.0)
-    lora_target_modules: tuple[str, ...] = field(default=('q_proj', 'v_proj'))
 
     # Reward toggles (D4). Semantic stays off by default (needs rendering).
     use_overlap: bool = field(default=True)
@@ -169,9 +171,11 @@ def _sequence_logprobs(base, prefix_embeds, prompt_ids, gen_ids) -> torch.Tensor
     """
     embed = base.get_input_embeddings()
     seq = torch.cat([prefix_embeds, embed(prompt_ids), embed(gen_ids)], dim=1)
-    # We pass inputs_embeds directly (bypassing the embedding hook), and the embeddings are frozen, so
-    # seq carries no grad. Mark it grad-requiring so gradient checkpointing tracks through to LoRA.
-    if torch.is_grad_enabled():
+    # We pass inputs_embeds directly (bypassing the embedding hook). In Path B the prefix already
+    # requires grad (the encoder is trainable), so seq does too and we must NOT re-flag it
+    # (requires_grad_ errors on a non-leaf that already requires grad). Only mark it when nothing
+    # upstream carries grad (frozen-prefix case), so gradient checkpointing still tracks through.
+    if torch.is_grad_enabled() and not seq.requires_grad:
         seq.requires_grad_(True)
     logits = base(inputs_embeds=seq, use_cache=False).logits          # [1, T+P+G, V]
     start = prefix_embeds.shape[1] + prompt_ids.shape[1]
@@ -199,9 +203,12 @@ class GRPOPromptSet:
 
 
 def load_policy(args, cfg, device):
-    """Builds BrickGPTWithMask, loads the SFT encoder, freezes encoder + base, and adds LoRA to the LLM."""
-    from peft import LoraConfig, get_peft_model
-
+    """
+    Builds BrickGPTWithMask, loads the SFT encoder, then sets up **Path B**: train the mask encoder,
+    freeze the LLM. Returns ``(model, ref_encoder, name)`` where ``ref_encoder`` is a frozen deepcopy of
+    the loaded SFT encoder used as the KL reference (the policy differs from the reference only through
+    the prefix, so the KL anchors the trained prefix to the SFT one).
+    """
     name = args.model_name_or_path
     if args.sft_checkpoint and os.path.exists(f'{args.sft_checkpoint}/sft_meta.json'):
         with open(f'{args.sft_checkpoint}/sft_meta.json') as f:
@@ -213,32 +220,58 @@ def load_policy(args, cfg, device):
         model.mask_prefix_encoder.load_state_dict(sd)
         logger.info('Loaded SFT mask encoder from %s', args.sft_checkpoint)
     else:
-        logger.warning('No SFT encoder found; starting GRPO from a fresh encoder (smoke only).')
+        logger.warning('No SFT encoder found; starting GRPO from a fresh encoder (smoke only). '
+                       'Encoder-trainable GRPO needs a non-degenerate SFT seed, else reward variance ~0.')
 
-    model.mask_prefix_encoder.requires_grad_(False)  # encoder frozen in Stage 2
-    lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-                      target_modules=list(args.lora_target_modules), task_type='CAUSAL_LM')
-    model.base = get_peft_model(model.base, lora)    # only LoRA params on the base are trainable
+    # Path B: freeze the LLM, train the encoder (the prefix carries the policy gradient).
+    model.base.requires_grad_(False)
+    model.mask_prefix_encoder.requires_grad_(True)
+
+    # Frozen SFT-encoder copy = KL reference (snapshot the seed before it starts moving).
+    ref_encoder = copy.deepcopy(model.mask_prefix_encoder).requires_grad_(False)
+    ref_encoder.eval()
+
     if args.gradient_checkpointing:
+        # Backprop reaches the input-level prefix through the frozen LLM, so full activations are needed
+        # even though the LLM is frozen; checkpointing trades compute for memory.
         model.base.gradient_checkpointing_enable()
         model.base.enable_input_require_grads()
-    return model, name
+    return model, ref_encoder, name
 
 
 @torch.no_grad()
 def rollout(model, tokenizer, prefix_embeds, prompt_ids, args, device):
-    """Samples G full completions from the mask-prefilled cache. Returns list of gen_id tensors + texts."""
-    from brickgpt.models.llm import LLM
-    llm = LLM.from_model(model.base, tokenizer, str(device))
+    """
+    Samples G full completions conditioned on the mask prefix, via ``generate(inputs_embeds=...)``.
+
+    The prefix is prepended as ``inputs_embeds`` (``[prefix, embed(prompt)]``) so HF's standard decoder
+    decode handles the KV cache. **Generation runs the LLM in eval mode**: the model has gradient
+    checkpointing enabled (for the log-prob backward), but in *train* mode that forces
+    ``use_cache=False``, which kills the KV cache *and* corrupts the conditioning -- so we flip to eval
+    for the rollout and restore the caller's mode after. Each completion is generated separately (so the
+    ``gen_ids`` are unpadded and line up 1:1 with :func:`_sequence_logprobs`). Llama has no dropout, so
+    eval-mode sampling and train-mode log-probs share the same distribution (exact at ``temperature=1``).
+
+    :return: ``group_size`` tuples ``(gen_ids[1D, new tokens only], decoded_text)``.
+    """
+    embed = model.base.get_input_embeddings()
+    inputs_embeds = torch.cat([prefix_embeds, embed(prompt_ids)], dim=1)
+    attn = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
+    was_training = model.base.training
+    model.base.eval()
     completions = []
-    llm.prefill_with_embeds(prefix_embeds, prompt_ids)
-    llm.save_state()
-    for _ in range(args.group_size):
-        gen_ids = llm(None, return_as_ids=True, max_new_tokens=args.max_gen_tokens,
-                      temperature=args.temperature, top_k=None, top_p=None)
-        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-        completions.append((gen_ids.detach(), text))
-        llm.rollback_to_saved_state()
+    try:
+        for _ in range(args.group_size):
+            out = model.base.generate(
+                inputs_embeds=inputs_embeds, attention_mask=attn,
+                do_sample=True, num_return_sequences=1, max_new_tokens=args.max_gen_tokens,
+                temperature=args.temperature, top_k=None, top_p=None,
+                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True)
+            gen_ids = out.sequences[0]  # inputs_embeds-only generation returns NEW tokens only
+            completions.append((gen_ids.detach(), tokenizer.decode(gen_ids, skip_special_tokens=True)))
+    finally:
+        model.base.train(was_training)
     return completions
 
 
@@ -259,7 +292,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    model, _ = load_policy(args, cfg, device)
+    model, ref_encoder, base_name = load_policy(args, cfg, device)
     model.train()
 
     from datasets import load_dataset
@@ -270,7 +303,7 @@ def main():
     run = RunLogger(total=args.max_steps, phase='grpo', report_to=args.report_to,
                     console_every=args.log_every, project=args.wandb_project, name=args.run_name,
                     config=vars(args))
-    embed_base = model.base  # PeftModel; get_input_embeddings works through it
+    embed_base = model.base  # frozen LLM; used for teacher-forced log-probs (policy + reference)
 
     for step in range(1, args.max_steps + 1):
         caption, mask, presence, target = prompts.sample()
@@ -280,8 +313,13 @@ def main():
             add_generation_prompt=True, return_tensors='pt').to(device)
         mask_t = torch.from_numpy(mask).unsqueeze(0).float().to(device)
         has_mask_t = torch.from_numpy(presence).unsqueeze(0).to(device)
+        # Path B: the prefix carries the gradient, so compute it WITH grad and reuse it for the
+        # grad-tracked log-probs below. rollout() reads it under its own no_grad, so sampling stays
+        # grad-free. ref_prefix_embeds (frozen SFT encoder) is the KL anchor.
+        out_dtype = next(model.base.parameters()).dtype
+        prefix_embeds = model.mask_prefix_encoder(mask_t, has_mask_t).to(out_dtype)
         with torch.no_grad():
-            prefix_embeds = model.mask_prefix_encoder(mask_t, has_mask_t).to(next(model.base.parameters()).dtype)
+            ref_prefix_embeds = ref_encoder(mask_t, has_mask_t).to(out_dtype)
 
         completions = rollout(model, tokenizer, prefix_embeds, prompt_ids, args, device)
 
@@ -307,9 +345,11 @@ def main():
                 continue
             gen_ids_b = gen_ids.unsqueeze(0).to(device)
             logp = _sequence_logprobs(embed_base, prefix_embeds, prompt_ids, gen_ids_b)
-            with torch.no_grad():
-                with model.base.disable_adapter():
-                    ref_logp = _sequence_logprobs(embed_base, prefix_embeds, prompt_ids, gen_ids_b)
+            with torch.no_grad():  # reference = frozen SFT-encoder prefix through the (frozen) LLM
+                # (this no_grad forward trips a benign "None of the inputs have requires_grad"
+                #  checkpoint warning -- it's the ref, we don't want its grad; the policy logp above
+                #  still delivers full gradient to the encoder.)
+                ref_logp = _sequence_logprobs(embed_base, ref_prefix_embeds, prompt_ids, gen_ids_b)
             kl = torch.exp(ref_logp - logp) - (ref_logp - logp) - 1.0  # k3 estimator, per token
             if args.use_multi_turn:  # per-token advantage: brick t's span carries A_t, else 0
                 adv = torch.zeros(logp.shape[0], dtype=logp.dtype, device=device)
@@ -351,9 +391,9 @@ def main():
         run.log(metrics, step=step)
 
         if args.save_every and step % args.save_every == 0:
-            _save(model, args, f'step{step}')
+            _save(model, cfg, base_name, args, f'step{step}')
 
-    _save(model, args, 'final')
+    _save(model, cfg, base_name, args, 'final')
     run.close()
 
 
@@ -362,10 +402,15 @@ def _instruction(caption):
     return create_instruction(caption)
 
 
-def _save(model, args, tag):
+def _save(model, cfg, name, args, tag):
     os.makedirs(args.output_dir, exist_ok=True)
-    model.base.save_pretrained(f'{args.output_dir}/lora_{tag}')  # LoRA adapter only
-    logger.info('Saved LoRA adapter (%s) to %s', tag, args.output_dir)
+    # Only the mask encoder trains in Path B (the LLM is frozen): save it alone, plus an SFT-style meta,
+    # so the output dir is itself loadable as a --sft_checkpoint (load_policy reads mask_encoder_final.pt
+    # + sft_meta.json -- e.g. to resume or re-seed).
+    torch.save(model.mask_prefix_encoder.state_dict(), f'{args.output_dir}/mask_encoder_{tag}.pt')
+    with open(f'{args.output_dir}/sft_meta.json', 'w') as f:
+        json.dump({'model_name_or_path': name, 'mask_config': cfg.__dict__}, f, indent=2)
+    logger.info('Saved mask encoder (%s) to %s', tag, args.output_dir)
 
 
 if __name__ == '__main__':
