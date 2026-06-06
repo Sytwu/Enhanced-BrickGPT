@@ -23,6 +23,7 @@ def render_bricks(
         instructions_look: bool = False,
         fov: float = 45,
         img_resolution: int = 512,
+        samples: int = 512,
 ) -> None:
     in_file = os.path.abspath(in_file)
     out_file = os.path.abspath(out_file)
@@ -47,7 +48,7 @@ def render_bricks(
 
         # Set the device and feature set
         bpy.context.scene.cycles.device = 'GPU'
-        bpy.context.scene.cycles.samples = 512
+        bpy.context.scene.cycles.samples = samples
 
         # get_devices() to let Blender detects GPU device
         bpy.context.preferences.addons['cycles'].preferences.get_devices()
