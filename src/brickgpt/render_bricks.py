@@ -132,10 +132,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--in_file', type=str, help='Path to LDR file')
     parser.add_argument('--out_file', type=str, help='Path to output image file')
+    parser.add_argument('--samples', type=int, default=512, help='Cycles render samples (lower = faster).')
+    parser.add_argument('--img_resolution', type=int, default=512, help='Square render resolution in pixels.')
     args = parser.parse_args()
 
     # Get the absolute path of the input file
-    render_bricks(args.in_file, args.out_file, square_image=True, instructions_look=False)
+    render_bricks(args.in_file, args.out_file, square_image=True, instructions_look=False,
+                  samples=args.samples, img_resolution=args.img_resolution)
     print(f'Rendered image to {args.out_file}')
 
 

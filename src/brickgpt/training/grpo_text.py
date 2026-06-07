@@ -54,6 +54,21 @@ class GRPOTextArguments:
     train_split: str = field(default='train')
     output_dir: str = field(default='output/grpo_text')
 
+    # Resume a prior GRPO run: load its saved LoRA adapter as the trainable policy (instead of a fresh
+    # adapter) and offset the step counter so saving / logging continue from where it left off. NOTE:
+    # the optimizer (Adam) state is not checkpointed, so the moments restart -- weights resume, momentum
+    # does not.
+    resume_from: str | None = field(
+        default=None,
+        metadata={'help': 'Dir of a saved LoRA adapter (e.g. output/grpo_text/adapter_final) to continue '
+                          'training from. If None, starts a fresh adapter.'},
+    )
+    start_step: int = field(
+        default=0,
+        metadata={'help': 'Step the loop resumes after (1-based). Run goes start_step+1 .. max_steps. '
+                          'Set to the step count already trained when --resume_from is used.'},
+    )
+
     group_size: int = field(default=8, metadata={'help': 'G: completions sampled per prompt.'})
     max_gen_tokens: int = field(default=400)
     temperature: float = field(default=1.0)
@@ -111,12 +126,16 @@ class TextPromptSet:
         return random.choice(self.captions)
 
 
-def _sequence_logprobs(model, prompt_ids, gen_ids) -> torch.Tensor:
+def _sequence_logprobs(model, prompt_ids, gen_ids, temperature: float = 1.0) -> torch.Tensor:
     """
     Per-token log-probs of ``gen_ids`` under ``model``, teacher-forced over ``[prompt, gen]``.
 
     Grad flows iff the model's params (the LoRA adapter) require it; call under
     ``model.disable_adapter()`` + ``no_grad`` to get the frozen-base reference log-probs.
+
+    ``temperature`` must match the sampling temperature used in :func:`rollout`: HF samples from
+    ``softmax(logits / T)``, so the on-policy log-probs (and thus the REINFORCE gradient + KL) are only
+    unbiased if scored under the same scaled distribution. At ``T=1`` this is a no-op.
 
     :return: ``(num_gen_tokens,)`` log-probs.
     """
@@ -124,7 +143,7 @@ def _sequence_logprobs(model, prompt_ids, gen_ids) -> torch.Tensor:
     logits = model(input_ids=seq, use_cache=False).logits                 # [1, P+G, V]
     start = prompt_ids.shape[1]
     gen_logits = logits[:, start - 1: start - 1 + gen_ids.shape[1], :]    # predicts each gen token
-    logp = torch.log_softmax(gen_logits.float(), dim=-1)
+    logp = torch.log_softmax(gen_logits.float() / temperature, dim=-1)
     return logp.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1).squeeze(0)
 
 
@@ -146,12 +165,19 @@ def load_policy(args, device):
     base = AutoModelForCausalLM.from_pretrained(peft_cfg.base_model_name_or_path, torch_dtype=torch.bfloat16)
     backbone = PeftModel.from_pretrained(base, args.model_name_or_path).merge_and_unload()
     backbone = backbone.to(device)
-    lora_cfg = LoraConfig(
-        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-        target_modules=[m.strip() for m in args.lora_target_modules.split(',') if m.strip()],
-        task_type='CAUSAL_LM', bias='none',
-    )
-    model = get_peft_model(backbone, lora_cfg)
+    if args.resume_from:
+        # Continue a prior run: load its saved adapter as the *trainable* policy (is_trainable=True) on
+        # the merged backbone, instead of a fresh adapter. lora_r/alpha/targets come from the saved
+        # adapter_config.json. disable_adapter() still recovers the merged base BrickGPT as the KL ref.
+        model = PeftModel.from_pretrained(backbone, args.resume_from, is_trainable=True)
+        logger.info('Resumed LoRA adapter from %s (start_step=%d)', args.resume_from, args.start_step)
+    else:
+        lora_cfg = LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            target_modules=[m.strip() for m in args.lora_target_modules.split(',') if m.strip()],
+            task_type='CAUSAL_LM', bias='none',
+        )
+        model = get_peft_model(backbone, lora_cfg)
     if args.gradient_checkpointing:
         # Backprop reaches the LoRA params through the (frozen) base; checkpointing trades compute for
         # memory. enable_input_require_grads lets checkpointing track through the frozen embeddings.
@@ -235,11 +261,11 @@ def main():
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=args.lr)
-    run = RunLogger(total=args.max_steps, phase='grpo', report_to=args.report_to,
+    run = RunLogger(total=args.max_steps - args.start_step, phase='grpo', report_to=args.report_to,
                     console_every=args.log_every, project=args.wandb_project, name=args.run_name,
                     config=vars(args))
 
-    for step in range(1, args.max_steps + 1):
+    for step in range(args.start_step + 1, args.max_steps + 1):
         caption = prompts.sample()
         prompt_ids = tokenizer.apply_chat_template(
             [{'role': 'system', 'content': 'You are a helpful assistant.'},
@@ -272,9 +298,9 @@ def main():
             if gen_ids.numel() == 0:
                 continue
             gen_ids_b = gen_ids.unsqueeze(0).to(device)
-            logp = _sequence_logprobs(model, prompt_ids, gen_ids_b)
+            logp = _sequence_logprobs(model, prompt_ids, gen_ids_b, args.temperature)
             with torch.no_grad(), model.disable_adapter():  # reference = frozen base (adapter off)
-                ref_logp = _sequence_logprobs(model, prompt_ids, gen_ids_b)
+                ref_logp = _sequence_logprobs(model, prompt_ids, gen_ids_b, args.temperature)
             kl = torch.exp(ref_logp - logp) - (ref_logp - logp) - 1.0  # k3 estimator, per token
             if args.use_multi_turn:  # per-token advantage: brick t's span carries A_t, else 0
                 adv = torch.zeros(logp.shape[0], dtype=logp.dtype, device=device)
