@@ -29,9 +29,11 @@ finetuning = [
 infer = "brickgpt.infer:main"
 prepare_finetuning_dataset = "brickgpt.prepare_finetuning_dataset:main"
 prepare_mask_dataset = "brickgpt.prepare_mask_dataset:main"
+prepare_text_mask_dataset = "brickgpt.prepare_text_mask_dataset:main"
 render_bricks = "brickgpt.render_bricks:main"
 visualize_sample = "brickgpt.visualize_sample:main"
 train_sft_masked = "brickgpt.training.sft_masked:main"
+train_sft_text_mask = "brickgpt.training.sft_text_mask:main"
 train_grpo_masked = "brickgpt.training.grpo_masked:main"
 train_grpo_text = "brickgpt.training.grpo_text:main"
 

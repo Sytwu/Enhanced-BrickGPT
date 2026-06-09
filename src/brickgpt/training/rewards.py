@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 from brickgpt.data import Brick, BrickStructure
-from brickgpt.masking import MaskConditioningConfig, VIEW_AXES
+from brickgpt.masking import MaskConditioningConfig, VIEW_AXES, VIEW_ORDER
 from brickgpt.stability_analysis import connectivity_score
 
 logger = logging.getLogger(__name__)
@@ -166,6 +166,25 @@ def silhouette_iou_from_structure(
         union = np.logical_or(pred, tgt).sum()
         ious.append(1.0 if union == 0 else inter / union)
     return float(np.mean(ious)) if ious else None
+
+
+def silhouette_iou_per_view(structure: BrickStructure, gt_views: dict[str, np.ndarray]) -> dict[str, float]:
+    """
+    Per-view IoU (top / front / side reported separately) between a generated structure's silhouettes
+    and the GT silhouettes. Unlike :func:`silhouette_iou_from_structure` (which averages over provided
+    views into a single scalar for the reward), this keeps the views split so eval / SFT probes can
+    show which view the model follows. Union==0 -> 1.0, matching the reward convention.
+
+    :param gt_views: ``{'top'|'front'|'side': (H, W) array}``, e.g. from :func:`three_view_masks`.
+    """
+    out = {}
+    for name in VIEW_ORDER:
+        pred = structure.top_down_mask(VIEW_AXES[name]) > 0.5
+        tgt = np.asarray(gt_views[name]) > 0.5
+        inter = np.logical_and(pred, tgt).sum()
+        union = np.logical_or(pred, tgt).sum()
+        out[name] = 1.0 if union == 0 else float(inter / union)
+    return out
 
 
 def normalize_clip_score(score: float, cfg: RewardConfig) -> float:
