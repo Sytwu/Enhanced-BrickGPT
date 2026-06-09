@@ -45,7 +45,9 @@ class EvalArguments:
     base_model: str = field(default='AvaLovelace/BrickGPT')
     adapter_dir: str = field(default='output/grpo_text/adapter_final')
     dataset_name: str = field(default='AvaLovelace/StableText2Brick')
-    split: str = field(default='train')
+    split: str = field(default='test', metadata={'help': 'HELD-OUT split for reporting. NOTE: earlier '
+                                                          'eval logs (eval_2k/eval_final) used the old '
+                                                          '"train" default and are NOT held-out.'})
 
     num_prompts: int = field(default=20, metadata={'help': 'Distinct captions to evaluate on.'})
     samples_per_prompt: int = field(default=4, metadata={'help': 'K unconstrained completions per caption.'})

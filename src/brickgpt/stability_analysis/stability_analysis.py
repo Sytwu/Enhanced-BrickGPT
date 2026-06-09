@@ -18,6 +18,8 @@ class StabilityConfig:
     world_dimension: tuple[int, int, int] = (20, 20, 20)
     alpha: float = 0.001
     beta: float = 0.000001
+    time_limit: float | None = None  # Gurobi TimeLimit (s) per solve; None = unbounded. Keeps a big
+    #                                  MIQP from hanging a batch eval (see scripts/eval_grpo_table.py).
 
 
 def stability_score(brick_structure, brick_library, cfg=StabilityConfig()):
@@ -41,6 +43,8 @@ def stability_score(brick_structure, brick_library, cfg=StabilityConfig()):
     model.setParam("OutputFlag", print_log)
     model.Params.IterationLimit = 1000000
     model.setParam("MIPFocus", 1)
+    if cfg.time_limit is not None:
+        model.Params.TimeLimit = cfg.time_limit
     big_num = 100 * n_bricks
 
     # Define variables
