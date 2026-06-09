@@ -29,6 +29,7 @@ finetuning = [
 infer = "brickgpt.infer:main"
 prepare_finetuning_dataset = "brickgpt.prepare_finetuning_dataset:main"
 prepare_mask_dataset = "brickgpt.prepare_mask_dataset:main"
+prepare_mask_dataset_text = "brickgpt.prepare_mask_dataset_text:main"
 render_bricks = "brickgpt.render_bricks:main"
 visualize_sample = "brickgpt.visualize_sample:main"
 train_sft_masked = "brickgpt.training.sft_masked:main"
@@ -40,3 +41,12 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = ["pytest"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }

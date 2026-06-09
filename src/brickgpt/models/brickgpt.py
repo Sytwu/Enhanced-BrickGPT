@@ -227,9 +227,11 @@ class BrickGPT:
         ]
         if starting_bricks_txt:  # Continue generation from a partial structure
             messages.append({'role': 'assistant', 'content': starting_bricks_txt})
-            prompt = self.llm.tokenizer.apply_chat_template(messages, continue_final_message=True, return_tensors='pt')
+            _tpl = self.llm.tokenizer.apply_chat_template(messages, continue_final_message=True, return_tensors='pt')
         else:
-            prompt = self.llm.tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors='pt')
+            _tpl = self.llm.tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors='pt')
+        # apply_chat_template returns BatchEncoding in newer transformers; extract the ids tensor.
+        prompt = _tpl['input_ids'] if hasattr(_tpl, '__getitem__') and not isinstance(_tpl, torch.Tensor) else _tpl
 
         # With mask conditioning, prefill the cache with the mask prefix + prompt, then generate by
         # continuation (prompt=None). Without it, the first brick uses the prompt directly as before.
